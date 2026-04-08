@@ -16,6 +16,7 @@ ENV_FILE = Path(".env")
 
 ORDER_PREVIEW_OUTPUT = Path("alpaca_order_preview.csv")
 EXECUTION_LOG_OUTPUT = Path("alpaca_execution_log.csv")
+TRADE_LOG_OUTPUT = Path("alpaca_trade_log.csv")
 
 DEFAULT_BASE_URL = "https://paper-api.alpaca.markets"
 DEFAULT_DRY_RUN = True
@@ -274,6 +275,76 @@ def build_leg_targets(ready_universe: pd.DataFrame, account_equity: float, confi
     return aggregated
 
 
+def build_pair_trade_plan(ready_universe: pd.DataFrame, account_equity: float, config: AlpacaConfig) -> pd.DataFrame:
+    """Build a clear per-pair trade plan for actionable live signals."""
+    if ready_universe.empty:
+        return pd.DataFrame()
+
+    plan_rows: List[Dict[str, object]] = []
+
+    for _, row in ready_universe.iterrows():
+        action = str(row.get("current_action", "")).strip()
+        if action not in {"LONG_SPREAD", "SHORT_SPREAD"}:
+            continue
+
+        beta = abs(safe_float(row.get("live_beta")))
+        price_x = safe_float(row.get("latest_price_x"))
+        price_y = safe_float(row.get("latest_price_y"))
+        weight = max(safe_float(row.get("portfolio_weight")), 0.0)
+
+        if not np.isfinite(beta) or not np.isfinite(price_x) or not np.isfinite(price_y):
+            continue
+        if beta <= 0 or price_x <= 0 or price_y <= 0 or weight <= 0:
+            continue
+
+        gross_pair_notional = account_equity * config.gross_exposure_fraction * weight
+        x_weight = 1.0 / (1.0 + beta)
+        y_weight = beta / (1.0 + beta)
+
+        x_notional = gross_pair_notional * x_weight
+        y_notional = gross_pair_notional * y_weight
+
+        if x_notional < config.min_leg_notional or y_notional < config.min_leg_notional:
+            continue
+
+        x_qty = int(np.floor(x_notional / price_x))
+        y_qty = int(np.floor(y_notional / price_y))
+        if x_qty <= 0 or y_qty <= 0:
+            continue
+
+        if action == "LONG_SPREAD":
+            long_symbol = str(row["stock_x"]).upper()
+            long_qty = x_qty
+            short_symbol = str(row["stock_y"]).upper()
+            short_qty = y_qty
+            exit_rule = "Exit when z-score >= 0.0"
+        else:
+            long_symbol = str(row["stock_y"]).upper()
+            long_qty = y_qty
+            short_symbol = str(row["stock_x"]).upper()
+            short_qty = x_qty
+            exit_rule = "Exit when z-score <= 0.0"
+
+        plan_rows.append(
+            {
+                "signal_date": row["latest_date"],
+                "pair": row["pair"],
+                "action": action,
+                "long_symbol": long_symbol,
+                "long_qty": long_qty,
+                "short_symbol": short_symbol,
+                "short_qty": short_qty,
+                "portfolio_weight": safe_float(row["portfolio_weight"]),
+                "live_zscore": safe_float(row["live_zscore"]),
+                "live_beta": safe_float(row["live_beta"]),
+                "live_half_life": safe_float(row["live_half_life"]),
+                "exit_rule": exit_rule,
+            }
+        )
+
+    return pd.DataFrame(plan_rows)
+
+
 def build_current_position_map(positions: List[Dict[str, object]]) -> Dict[str, int]:
     """Normalize Alpaca position quantities into signed integer shares."""
     current_positions: Dict[str, int] = {}
@@ -383,6 +454,59 @@ def execute_orders(client: AlpacaClient, preview_df: pd.DataFrame) -> pd.DataFra
     return pd.DataFrame(execution_rows)
 
 
+def build_trade_log_rows(pair_trade_plan: pd.DataFrame, execution_df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize each executed pair trade in one clear log row."""
+    if pair_trade_plan.empty or execution_df.empty:
+        return pd.DataFrame()
+
+    execution_map = (
+        execution_df.groupby("source_pairs", as_index=False)
+        .agg(
+            submitted_at=("submitted_at", "first"),
+            order_count=("alpaca_order_id", "count"),
+            alpaca_status=("alpaca_status", lambda values: "|".join(sorted(set(map(str, values))))),
+            order_ids=("alpaca_order_id", lambda values: "|".join(map(str, values))),
+        )
+        .rename(columns={"source_pairs": "pair"})
+    )
+
+    trade_log = pair_trade_plan.merge(execution_map, on="pair", how="inner")
+    if trade_log.empty:
+        return trade_log
+
+    ordered_columns = [
+        "submitted_at",
+        "signal_date",
+        "pair",
+        "action",
+        "long_symbol",
+        "long_qty",
+        "short_symbol",
+        "short_qty",
+        "portfolio_weight",
+        "live_zscore",
+        "live_beta",
+        "live_half_life",
+        "exit_rule",
+        "order_count",
+        "alpaca_status",
+        "order_ids",
+    ]
+    return trade_log[ordered_columns]
+
+
+def append_csv_rows(path: Path, rows: pd.DataFrame) -> None:
+    """Append rows to a CSV log, creating it if needed."""
+    if rows.empty:
+        return
+
+    if path.exists():
+        existing = pd.read_csv(path)
+        rows = pd.concat([existing, rows], ignore_index=True)
+
+    rows.to_csv(path, index=False)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Submit PAPER_TRADE_READY pair trades to Alpaca paper trading.")
     parser.add_argument(
@@ -421,7 +545,8 @@ def main() -> None:
         raise ValueError("Alpaca account equity is unavailable or invalid.")
 
     leg_targets = build_leg_targets(ready_universe, account_equity, config)
-    if leg_targets.empty:
+    pair_trade_plan = build_pair_trade_plan(ready_universe, account_equity, config)
+    if leg_targets.empty or pair_trade_plan.empty:
         raise ValueError("No executable target legs were produced from the ready pairs.")
 
     managed_symbols = sorted(
@@ -462,12 +587,13 @@ def main() -> None:
         print("No orders were submitted.")
         return
 
-    if EXECUTION_LOG_OUTPUT.exists():
-        existing = pd.read_csv(EXECUTION_LOG_OUTPUT)
-        execution_df = pd.concat([existing, execution_df], ignore_index=True)
+    trade_log_df = build_trade_log_rows(pair_trade_plan, execution_df)
 
-    execution_df.to_csv(EXECUTION_LOG_OUTPUT, index=False)
+    append_csv_rows(EXECUTION_LOG_OUTPUT, execution_df)
+    append_csv_rows(TRADE_LOG_OUTPUT, trade_log_df)
+
     print(f"\nExecution log updated: {EXECUTION_LOG_OUTPUT.resolve()}")
+    print(f"Trade log updated: {TRADE_LOG_OUTPUT.resolve()}")
 
 
 if __name__ == "__main__":
