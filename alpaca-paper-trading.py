@@ -21,6 +21,7 @@ TRADE_LOG_OUTPUT = Path("alpaca_trade_log.csv")
 DEFAULT_BASE_URL = "https://paper-api.alpaca.markets"
 DEFAULT_DRY_RUN = True
 DEFAULT_GROSS_EXPOSURE_FRACTION = 0.90
+DEFAULT_BUYING_POWER_USAGE_FRACTION = 0.50
 DEFAULT_MIN_LEG_NOTIONAL = 100.0
 DEFAULT_MAX_SIGNAL_STALENESS_DAYS = 3
 REQUEST_TIMEOUT_SECONDS = 20
@@ -35,6 +36,7 @@ class AlpacaConfig:
     base_url: str
     dry_run: bool
     gross_exposure_fraction: float
+    buying_power_usage_fraction: float
     min_leg_notional: float
     max_signal_staleness_days: int
 
@@ -108,6 +110,10 @@ def load_config() -> AlpacaConfig:
             "ALPACA_GROSS_EXPOSURE_FRACTION",
             DEFAULT_GROSS_EXPOSURE_FRACTION,
         ),
+        buying_power_usage_fraction=parse_float_env(
+            "ALPACA_BUYING_POWER_USAGE_FRACTION",
+            DEFAULT_BUYING_POWER_USAGE_FRACTION,
+        ),
         min_leg_notional=parse_float_env(
             "ALPACA_MIN_LEG_NOTIONAL",
             DEFAULT_MIN_LEG_NOTIONAL,
@@ -156,7 +162,12 @@ class AlpacaClient:
             json=payload,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-        response.raise_for_status()
+        if not response.ok:
+            detail = response.text.strip()
+            raise requests.HTTPError(
+                f"{response.status_code} {response.reason} for {method} {path}: {detail}",
+                response=response,
+            )
         return response.json()
 
     def get_account(self) -> Dict[str, object]:
@@ -200,7 +211,23 @@ def build_ready_universe(ready_signals: pd.DataFrame, ranked_pairs: pd.DataFrame
     return merged
 
 
-def build_leg_targets(ready_universe: pd.DataFrame, account_equity: float, config: AlpacaConfig) -> pd.DataFrame:
+def determine_deployable_capital(account: Dict[str, object], config: AlpacaConfig) -> float:
+    """Cap deployment by both equity budget and currently available buying power."""
+    equity = safe_float(account.get("equity"))
+    buying_power = safe_float(account.get("buying_power"))
+
+    if not np.isfinite(equity) or equity <= 0:
+        return float("nan")
+
+    equity_budget = equity * config.gross_exposure_fraction
+    if not np.isfinite(buying_power) or buying_power <= 0:
+        return equity_budget
+
+    buying_power_budget = buying_power * config.buying_power_usage_fraction
+    return min(equity_budget, buying_power_budget)
+
+
+def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, config: AlpacaConfig) -> pd.DataFrame:
     """Convert pair allocations into per-symbol target share counts."""
     if ready_universe.empty:
         return pd.DataFrame()
@@ -222,7 +249,7 @@ def build_leg_targets(ready_universe: pd.DataFrame, account_equity: float, confi
         if beta <= 0 or price_x <= 0 or price_y <= 0 or weight <= 0:
             continue
 
-        gross_pair_notional = account_equity * config.gross_exposure_fraction * weight
+        gross_pair_notional = deployable_capital * weight
         x_weight = 1.0 / (1.0 + beta)
         y_weight = beta / (1.0 + beta)
 
@@ -275,7 +302,7 @@ def build_leg_targets(ready_universe: pd.DataFrame, account_equity: float, confi
     return aggregated
 
 
-def build_pair_trade_plan(ready_universe: pd.DataFrame, account_equity: float, config: AlpacaConfig) -> pd.DataFrame:
+def build_pair_trade_plan(ready_universe: pd.DataFrame, deployable_capital: float, config: AlpacaConfig) -> pd.DataFrame:
     """Build a clear per-pair trade plan for actionable live signals."""
     if ready_universe.empty:
         return pd.DataFrame()
@@ -297,7 +324,7 @@ def build_pair_trade_plan(ready_universe: pd.DataFrame, account_equity: float, c
         if beta <= 0 or price_x <= 0 or price_y <= 0 or weight <= 0:
             continue
 
-        gross_pair_notional = account_equity * config.gross_exposure_fraction * weight
+        gross_pair_notional = deployable_capital * weight
         x_weight = 1.0 / (1.0 + beta)
         y_weight = beta / (1.0 + beta)
 
@@ -431,25 +458,45 @@ def execute_orders(client: AlpacaClient, preview_df: pd.DataFrame) -> pd.DataFra
 
     for index, row in preview_df.reset_index(drop=True).iterrows():
         symbol = str(row["symbol"]).upper()
-        response = client.submit_order(
-            symbol=symbol,
-            qty=int(row["order_qty"]),
-            side=str(row["side"]),
-            client_order_id=f"pairs-{timestamp}-{index + 1}-{symbol}".lower(),
-        )
-        execution_rows.append(
-            {
-                "submitted_at": datetime.now().isoformat(timespec="seconds"),
-                "symbol": symbol,
-                "side": row["side"],
-                "order_qty": int(row["order_qty"]),
-                "target_qty": int(row["target_qty"]),
-                "current_qty": int(row["current_qty"]),
-                "alpaca_order_id": response.get("id", ""),
-                "alpaca_status": response.get("status", ""),
-                "source_pairs": row["source_pairs"],
-            }
-        )
+        side = str(row["side"])
+        qty = int(row["order_qty"])
+        try:
+            response = client.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                client_order_id=f"pairs-{timestamp}-{index + 1}-{symbol}".lower(),
+            )
+            execution_rows.append(
+                {
+                    "submitted_at": datetime.now().isoformat(timespec="seconds"),
+                    "symbol": symbol,
+                    "side": side,
+                    "order_qty": qty,
+                    "target_qty": int(row["target_qty"]),
+                    "current_qty": int(row["current_qty"]),
+                    "alpaca_order_id": response.get("id", ""),
+                    "alpaca_status": response.get("status", ""),
+                    "source_pairs": row["source_pairs"],
+                    "error": "",
+                }
+            )
+        except requests.HTTPError as exc:
+            execution_rows.append(
+                {
+                    "submitted_at": datetime.now().isoformat(timespec="seconds"),
+                    "symbol": symbol,
+                    "side": side,
+                    "order_qty": qty,
+                    "target_qty": int(row["target_qty"]),
+                    "current_qty": int(row["current_qty"]),
+                    "alpaca_order_id": "",
+                    "alpaca_status": "rejected",
+                    "source_pairs": row["source_pairs"],
+                    "error": str(exc),
+                }
+            )
+            print(f"Order rejected for {symbol} {side} {qty}: {exc}")
 
     return pd.DataFrame(execution_rows)
 
@@ -541,11 +588,16 @@ def main() -> None:
     positions = client.get_positions()
 
     account_equity = safe_float(account.get("equity"))
+    account_buying_power = safe_float(account.get("buying_power"))
     if not np.isfinite(account_equity) or account_equity <= 0:
         raise ValueError("Alpaca account equity is unavailable or invalid.")
 
-    leg_targets = build_leg_targets(ready_universe, account_equity, config)
-    pair_trade_plan = build_pair_trade_plan(ready_universe, account_equity, config)
+    deployable_capital = determine_deployable_capital(account, config)
+    if not np.isfinite(deployable_capital) or deployable_capital <= 0:
+        raise ValueError("No deployable capital is available from equity/buying power constraints.")
+
+    leg_targets = build_leg_targets(ready_universe, deployable_capital, config)
+    pair_trade_plan = build_pair_trade_plan(ready_universe, deployable_capital, config)
     if leg_targets.empty or pair_trade_plan.empty:
         raise ValueError("No executable target legs were produced from the ready pairs.")
 
@@ -557,6 +609,9 @@ def main() -> None:
     preview_df.to_csv(ORDER_PREVIEW_OUTPUT, index=False)
 
     print(f"Account equity: ${account_equity:,.2f}")
+    if np.isfinite(account_buying_power):
+        print(f"Account buying power: ${account_buying_power:,.2f}")
+    print(f"Deployable capital: ${deployable_capital:,.2f}")
     print(f"Preview saved to: {ORDER_PREVIEW_OUTPUT.resolve()}")
     if staleness_days > config.max_signal_staleness_days:
         latest_signal_date = pd.to_datetime(ready_signals["latest_date"]).max().date().isoformat()

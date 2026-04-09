@@ -86,7 +86,7 @@ SCORE_TRADE_WEIGHT = 0.05
 
 UNIVERSE: Dict[str, List[str]] = {
     "banks": ["JPM", "BAC", "WFC", "C", "MS", "GS", "PNC", "USB", "BK", "SCHW"],
-    "payments": ["V", "MA", "AXP", "PYPL", "COF", "DFS"],
+    "payments": ["V", "MA", "AXP", "PYPL", "COF"],
     "semis": ["NVDA", "AMD", "AVGO", "QCOM", "MU", "INTC", "AMAT", "LRCX", "KLAC", "TXN", "ADI"],
     "oil_majors": ["XOM", "CVX"],
     "energy_e&p": ["COP", "EOG", "OXY", "DVN"],
