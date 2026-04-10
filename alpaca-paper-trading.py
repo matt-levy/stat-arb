@@ -17,6 +17,10 @@ ENV_FILE = Path(".env")
 ORDER_PREVIEW_OUTPUT = Path("alpaca_order_preview.csv")
 EXECUTION_LOG_OUTPUT = Path("alpaca_execution_log.csv")
 TRADE_LOG_OUTPUT = Path("alpaca_trade_log.csv")
+ACCOUNT_SNAPSHOT_LOG_OUTPUT = Path("alpaca_account_snapshots.csv")
+POSITIONS_SNAPSHOT_LOG_OUTPUT = Path("alpaca_positions_snapshots.csv")
+ORDER_FILL_LOG_OUTPUT = Path("alpaca_order_fills.csv")
+PAIR_LIFECYCLE_LOG_OUTPUT = Path("alpaca_pair_lifecycle_log.csv")
 
 DEFAULT_BASE_URL = "https://paper-api.alpaca.markets"
 DEFAULT_DRY_RUN = True
@@ -177,6 +181,10 @@ class AlpacaClient:
     def get_positions(self) -> List[Dict[str, object]]:
         """Fetch all open positions."""
         return self.request("GET", "/v2/positions")
+
+    def get_order(self, order_id: str) -> Dict[str, object]:
+        """Fetch one order by id."""
+        return self.request("GET", f"/v2/orders/{order_id}")
 
     def submit_order(self, symbol: str, qty: int, side: str, client_order_id: str) -> Dict[str, object]:
         """Submit a simple market order."""
@@ -477,6 +485,10 @@ def execute_orders(client: AlpacaClient, preview_df: pd.DataFrame) -> pd.DataFra
                     "current_qty": int(row["current_qty"]),
                     "alpaca_order_id": response.get("id", ""),
                     "alpaca_status": response.get("status", ""),
+                    "filled_qty": safe_float(response.get("filled_qty")),
+                    "filled_avg_price": safe_float(response.get("filled_avg_price")),
+                    "created_at": response.get("created_at", ""),
+                    "updated_at": response.get("updated_at", ""),
                     "source_pairs": row["source_pairs"],
                     "error": "",
                 }
@@ -492,6 +504,10 @@ def execute_orders(client: AlpacaClient, preview_df: pd.DataFrame) -> pd.DataFra
                     "current_qty": int(row["current_qty"]),
                     "alpaca_order_id": "",
                     "alpaca_status": "rejected",
+                    "filled_qty": float("nan"),
+                    "filled_avg_price": float("nan"),
+                    "created_at": "",
+                    "updated_at": "",
                     "source_pairs": row["source_pairs"],
                     "error": str(exc),
                 }
@@ -540,6 +556,103 @@ def build_trade_log_rows(pair_trade_plan: pd.DataFrame, execution_df: pd.DataFra
         "order_ids",
     ]
     return trade_log[ordered_columns]
+
+
+def build_account_snapshot_rows(account: Dict[str, object], deployable_capital: float) -> pd.DataFrame:
+    """Build one-row account snapshot for the current run."""
+    snapshot = {
+        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "account_number": str(account.get("account_number", "")),
+        "status": str(account.get("status", "")),
+        "equity": safe_float(account.get("equity")),
+        "cash": safe_float(account.get("cash")),
+        "buying_power": safe_float(account.get("buying_power")),
+        "long_market_value": safe_float(account.get("long_market_value")),
+        "short_market_value": safe_float(account.get("short_market_value")),
+        "portfolio_value": safe_float(account.get("portfolio_value")),
+        "regt_buying_power": safe_float(account.get("regt_buying_power")),
+        "daytrading_buying_power": safe_float(account.get("daytrading_buying_power")),
+        "deployable_capital": safe_float(deployable_capital),
+    }
+    return pd.DataFrame([snapshot])
+
+
+def build_positions_snapshot_rows(positions: List[Dict[str, object]]) -> pd.DataFrame:
+    """Build a positions snapshot for the current run."""
+    captured_at = datetime.now().isoformat(timespec="seconds")
+    rows: List[Dict[str, object]] = []
+
+    for position in positions:
+        rows.append(
+            {
+                "captured_at": captured_at,
+                "symbol": str(position.get("symbol", "")),
+                "side": str(position.get("side", "")),
+                "qty": safe_float(position.get("qty")),
+                "market_value": safe_float(position.get("market_value")),
+                "avg_entry_price": safe_float(position.get("avg_entry_price")),
+                "current_price": safe_float(position.get("current_price")),
+                "unrealized_pl": safe_float(position.get("unrealized_pl")),
+                "unrealized_plpc": safe_float(position.get("unrealized_plpc")),
+                "cost_basis": safe_float(position.get("cost_basis")),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_pair_lifecycle_rows(ready_universe: pd.DataFrame, pair_trade_plan: pd.DataFrame) -> pd.DataFrame:
+    """Record the daily intended lifecycle state for each candidate pair."""
+    if ready_universe.empty:
+        return pd.DataFrame()
+
+    lifecycle = ready_universe.copy()
+    lifecycle["captured_at"] = datetime.now().isoformat(timespec="seconds")
+    executable_pairs = set(pair_trade_plan["pair"].astype(str)) if not pair_trade_plan.empty else set()
+    lifecycle["execution_state"] = lifecycle["pair"].astype(str).apply(
+        lambda pair: "EXECUTABLE" if pair in executable_pairs else "NON_EXECUTABLE"
+    )
+
+    ordered_columns = [
+        "captured_at",
+        "latest_date",
+        "sector",
+        "pair",
+        "live_recommendation",
+        "current_action",
+        "current_position",
+        "portfolio_weight",
+        "live_zscore",
+        "live_beta",
+        "live_half_life",
+        "passes_live_stability",
+        "live_stability_reason",
+        "execution_state",
+    ]
+    return lifecycle[ordered_columns]
+
+
+def build_order_fill_rows(execution_df: pd.DataFrame) -> pd.DataFrame:
+    """Record submitted order status details in a compact fill/status log."""
+    if execution_df.empty:
+        return pd.DataFrame()
+
+    keep_columns = [
+        "submitted_at",
+        "symbol",
+        "side",
+        "order_qty",
+        "alpaca_order_id",
+        "alpaca_status",
+        "filled_qty",
+        "filled_avg_price",
+        "created_at",
+        "updated_at",
+        "source_pairs",
+        "error",
+    ]
+    available = [column for column in keep_columns if column in execution_df.columns]
+    return execution_df[available].copy()
 
 
 def append_csv_rows(path: Path, rows: pd.DataFrame) -> None:
@@ -598,6 +711,14 @@ def main() -> None:
 
     leg_targets = build_leg_targets(ready_universe, deployable_capital, config)
     pair_trade_plan = build_pair_trade_plan(ready_universe, deployable_capital, config)
+    pair_lifecycle_df = build_pair_lifecycle_rows(ready_universe, pair_trade_plan)
+    account_snapshot_df = build_account_snapshot_rows(account, deployable_capital)
+    positions_snapshot_df = build_positions_snapshot_rows(positions)
+
+    append_csv_rows(ACCOUNT_SNAPSHOT_LOG_OUTPUT, account_snapshot_df)
+    append_csv_rows(POSITIONS_SNAPSHOT_LOG_OUTPUT, positions_snapshot_df)
+    append_csv_rows(PAIR_LIFECYCLE_LOG_OUTPUT, pair_lifecycle_df)
+
     if leg_targets.empty or pair_trade_plan.empty:
         raise ValueError("No executable target legs were produced from the ready pairs.")
 
@@ -643,12 +764,18 @@ def main() -> None:
         return
 
     trade_log_df = build_trade_log_rows(pair_trade_plan, execution_df)
+    order_fill_log_df = build_order_fill_rows(execution_df)
 
     append_csv_rows(EXECUTION_LOG_OUTPUT, execution_df)
     append_csv_rows(TRADE_LOG_OUTPUT, trade_log_df)
+    append_csv_rows(ORDER_FILL_LOG_OUTPUT, order_fill_log_df)
 
     print(f"\nExecution log updated: {EXECUTION_LOG_OUTPUT.resolve()}")
     print(f"Trade log updated: {TRADE_LOG_OUTPUT.resolve()}")
+    print(f"Order fill log updated: {ORDER_FILL_LOG_OUTPUT.resolve()}")
+    print(f"Account snapshot log updated: {ACCOUNT_SNAPSHOT_LOG_OUTPUT.resolve()}")
+    print(f"Positions snapshot log updated: {POSITIONS_SNAPSHOT_LOG_OUTPUT.resolve()}")
+    print(f"Pair lifecycle log updated: {PAIR_LIFECYCLE_LOG_OUTPUT.resolve()}")
 
 
 if __name__ == "__main__":
