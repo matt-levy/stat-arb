@@ -1,5 +1,7 @@
 from datetime import datetime
 from pathlib import Path
+
+from project_paths import OUTPUTS_DIR, LOGS_DIR, ensure_project_directories
 from typing import Dict, List
 
 import numpy as np
@@ -10,11 +12,11 @@ import pandas as pd
 # Configuration
 # =========================
 
-LIVE_SIGNALS_INPUT = Path("live_pair_signals.csv")
-RANKED_PAIRS_INPUT = Path("ranked_pairs_walk_forward.csv")
+LIVE_SIGNALS_INPUT = OUTPUTS_DIR / "live_pair_signals.csv"
+RANKED_PAIRS_INPUT = OUTPUTS_DIR / "ranked_pairs_walk_forward.csv"
 
-READY_SIGNALS_OUTPUT = Path("paper_trade_ready_signals.csv")
-READY_LOG_OUTPUT = Path("paper_trade_ready_log.csv")
+READY_SIGNALS_OUTPUT = OUTPUTS_DIR / "paper_trade_ready_signals.csv"
+READY_LOG_OUTPUT = LOGS_DIR / "paper_trade_ready_log.csv"
 
 MAX_ACTIVE_PAIRS = 3
 MAX_PAIR_WEIGHT = 0.50
@@ -212,6 +214,7 @@ def print_ready_summary(ready_pairs: pd.DataFrame) -> None:
 # =========================
 
 def main() -> None:
+    ensure_project_directories()
     live_signals = load_csv(LIVE_SIGNALS_INPUT)
     ranked_pairs = load_csv(RANKED_PAIRS_INPUT)
 

@@ -3,6 +3,8 @@ import os
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+
+from project_paths import LOGS_DIR, OUTPUTS_DIR, ensure_project_directories
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -10,17 +12,17 @@ import pandas as pd
 import requests
 
 
-READY_SIGNALS_INPUT = Path("paper_trade_ready_signals.csv")
-RANKED_PAIRS_INPUT = Path("ranked_pairs_walk_forward.csv")
+READY_SIGNALS_INPUT = OUTPUTS_DIR / "paper_trade_ready_signals.csv"
+RANKED_PAIRS_INPUT = OUTPUTS_DIR / "ranked_pairs_walk_forward.csv"
 ENV_FILE = Path(".env")
 
-ORDER_PREVIEW_OUTPUT = Path("alpaca_order_preview.csv")
-EXECUTION_LOG_OUTPUT = Path("alpaca_execution_log.csv")
-TRADE_LOG_OUTPUT = Path("alpaca_trade_log.csv")
-ACCOUNT_SNAPSHOT_LOG_OUTPUT = Path("alpaca_account_snapshots.csv")
-POSITIONS_SNAPSHOT_LOG_OUTPUT = Path("alpaca_positions_snapshots.csv")
-ORDER_FILL_LOG_OUTPUT = Path("alpaca_order_fills.csv")
-PAIR_LIFECYCLE_LOG_OUTPUT = Path("alpaca_pair_lifecycle_log.csv")
+ORDER_PREVIEW_OUTPUT = OUTPUTS_DIR / "alpaca_order_preview.csv"
+EXECUTION_LOG_OUTPUT = LOGS_DIR / "alpaca_execution_log.csv"
+TRADE_LOG_OUTPUT = LOGS_DIR / "alpaca_trade_log.csv"
+ACCOUNT_SNAPSHOT_LOG_OUTPUT = LOGS_DIR / "alpaca_account_snapshots.csv"
+POSITIONS_SNAPSHOT_LOG_OUTPUT = LOGS_DIR / "alpaca_positions_snapshots.csv"
+ORDER_FILL_LOG_OUTPUT = LOGS_DIR / "alpaca_order_fills.csv"
+PAIR_LIFECYCLE_LOG_OUTPUT = LOGS_DIR / "alpaca_pair_lifecycle_log.csv"
 
 DEFAULT_BASE_URL = "https://paper-api.alpaca.markets"
 DEFAULT_DRY_RUN = True
@@ -668,6 +670,7 @@ def append_csv_rows(path: Path, rows: pd.DataFrame) -> None:
 
 
 def main() -> None:
+    ensure_project_directories()
     parser = argparse.ArgumentParser(description="Submit PAPER_TRADE_READY pair trades to Alpaca paper trading.")
     parser.add_argument(
         "--execute",
@@ -755,7 +758,7 @@ def main() -> None:
     if staleness_days > config.max_signal_staleness_days and not args.allow_stale:
         raise ValueError(
             f"Ready signals are stale by {staleness_days} days. "
-            f"Rerun pair-checker.py and paper-trading-ready.py first, or pass --allow-stale to override."
+            f"Rerun pair_checker.py and paper_trading_ready.py first, or pass --allow-stale to override."
         )
 
     execution_df = execute_orders(client, preview_df)

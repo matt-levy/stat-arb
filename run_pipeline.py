@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import List
 
 
-PAIR_CHECKER_SCRIPT = Path("pair-checker.py")
-READY_SIGNALS_SCRIPT = Path("paper-trading-ready.py")
-ALPACA_SCRIPT = Path("alpaca-paper-trading.py")
+PAIR_CHECKER_SCRIPT = Path("pair_checker.py")
+READY_SIGNALS_SCRIPT = Path("paper_trading_ready.py")
+ALPACA_SCRIPT = Path("alpaca_paper_trading.py")
 
 
 def run_step(command: List[str], label: str) -> None:
@@ -24,12 +24,12 @@ def main() -> None:
     parser.add_argument(
         "--skip-research",
         action="store_true",
-        help="Skip pair-checker.py and reuse existing research outputs.",
+        help="Skip pair_checker.py and reuse existing research outputs.",
     )
     parser.add_argument(
         "--skip-ready",
         action="store_true",
-        help="Skip paper-trading-ready.py and reuse the existing ready-signals file.",
+        help="Skip paper_trading_ready.py and reuse the existing ready-signals file.",
     )
     parser.add_argument(
         "--skip-alpaca",
@@ -39,12 +39,12 @@ def main() -> None:
     parser.add_argument(
         "--execute",
         action="store_true",
-        help="Pass --execute to alpaca-paper-trading.py.",
+        help="Pass --execute to alpaca_paper_trading.py.",
     )
     parser.add_argument(
         "--allow-stale",
         action="store_true",
-        help="Pass --allow-stale to alpaca-paper-trading.py.",
+        help="Pass --allow-stale to alpaca_paper_trading.py.",
     )
     args = parser.parse_args()
 

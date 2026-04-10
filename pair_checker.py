@@ -2,6 +2,8 @@ import itertools
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from pathlib import Path
+
+from project_paths import OUTPUTS_DIR, REPORTS_DIR, PLOTS_DIR, ensure_project_directories
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -56,13 +58,13 @@ TOP_N_PRINT = 20
 TOP_N_PLOTS = 5
 LIVE_SIGNAL_TOP_N = 10
 
-RANKED_OUTPUT_CSV = "ranked_pairs_walk_forward.csv"
-FAILED_OUTPUT_CSV = "failed_pairs_diagnostics.csv"
-NEAR_MISS_OUTPUT_CSV = "near_miss_pairs.csv"
-WINDOW_OUTPUT_CSV = "walk_forward_window_metrics.csv"
-LIVE_SIGNALS_OUTPUT_CSV = "live_pair_signals.csv"
-SUMMARY_REPORT_MD = "pair_research_summary.md"
-PLOT_DIR = Path("pair_plots")
+RANKED_OUTPUT_CSV = OUTPUTS_DIR / "ranked_pairs_walk_forward.csv"
+FAILED_OUTPUT_CSV = OUTPUTS_DIR / "failed_pairs_diagnostics.csv"
+NEAR_MISS_OUTPUT_CSV = OUTPUTS_DIR / "near_miss_pairs.csv"
+WINDOW_OUTPUT_CSV = OUTPUTS_DIR / "walk_forward_window_metrics.csv"
+LIVE_SIGNALS_OUTPUT_CSV = OUTPUTS_DIR / "live_pair_signals.csv"
+SUMMARY_REPORT_MD = REPORTS_DIR / "pair_research_summary.md"
+PLOT_DIR = PLOTS_DIR
 
 ROBUSTNESS_ENTRY_Z_DELTA = 0.25
 ROBUSTNESS_Z_WINDOW_DELTA = 5
@@ -1934,7 +1936,10 @@ def save_outputs(
     }
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Run the full pair research and live-signal pipeline."""
+    ensure_project_directories()
+
     clear_plot_dir(PLOT_DIR)
     ranked_pairs, diagnostics, window_metrics, downloaded_prices = analyze_universe(UNIVERSE)
     live_signals = build_live_signals(ranked_pairs, downloaded_prices, LIVE_SIGNAL_TOP_N)
@@ -1950,23 +1955,28 @@ if __name__ == "__main__":
         print(f"Live signals: {output_paths['live_signals']}")
         print(f"Summary report: {output_paths['summary']}")
         print(f"Plot folder: {output_paths['plots']}")
-    else:
-        plot_pair_diagnostics(
-            ranked_df=ranked_pairs,
-            prices=downloaded_prices,
-            top_n=TOP_N_PLOTS,
-            plot_dir=PLOT_DIR,
-        )
+        return
 
-        output_paths = save_outputs(ranked_pairs, diagnostics, window_metrics, live_signals)
-        print_top_ranked_pairs(ranked_pairs, TOP_N_PRINT)
-        print_sector_summary(ranked_pairs)
+    plot_pair_diagnostics(
+        ranked_df=ranked_pairs,
+        prices=downloaded_prices,
+        top_n=TOP_N_PLOTS,
+        plot_dir=PLOT_DIR,
+    )
 
-        print("\nSaved CSV files:")
-        print(f"Ranked qualifying pairs: {output_paths['ranked']}")
-        print(f"Failed pair diagnostics: {output_paths['failed']}")
-        print(f"Near-miss pairs: {output_paths['near_miss']}")
-        print(f"Window-level metrics: {output_paths['window']}")
-        print(f"Live signals: {output_paths['live_signals']}")
-        print(f"Summary report: {output_paths['summary']}")
-        print(f"Plot folder: {output_paths['plots']}")
+    output_paths = save_outputs(ranked_pairs, diagnostics, window_metrics, live_signals)
+    print_top_ranked_pairs(ranked_pairs, TOP_N_PRINT)
+    print_sector_summary(ranked_pairs)
+
+    print("\nSaved CSV files:")
+    print(f"Ranked qualifying pairs: {output_paths['ranked']}")
+    print(f"Failed pair diagnostics: {output_paths['failed']}")
+    print(f"Near-miss pairs: {output_paths['near_miss']}")
+    print(f"Window-level metrics: {output_paths['window']}")
+    print(f"Live signals: {output_paths['live_signals']}")
+    print(f"Summary report: {output_paths['summary']}")
+    print(f"Plot folder: {output_paths['plots']}")
+
+
+if __name__ == "__main__":
+    main()
