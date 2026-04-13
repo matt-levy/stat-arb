@@ -5,7 +5,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from project_paths import LOGS_DIR, OUTPUTS_DIR, ensure_project_directories
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,7 @@ ACCOUNT_SNAPSHOT_LOG_OUTPUT = LOGS_DIR / "alpaca_account_snapshots.csv"
 POSITIONS_SNAPSHOT_LOG_OUTPUT = LOGS_DIR / "alpaca_positions_snapshots.csv"
 ORDER_FILL_LOG_OUTPUT = LOGS_DIR / "alpaca_order_fills.csv"
 PAIR_LIFECYCLE_LOG_OUTPUT = LOGS_DIR / "alpaca_pair_lifecycle_log.csv"
+PAIR_RISK_EVENTS_LOG_OUTPUT = LOGS_DIR / "alpaca_pair_risk_events.csv"
 
 DEFAULT_BASE_URL = "https://paper-api.alpaca.markets"
 DEFAULT_DRY_RUN = True
@@ -30,6 +31,7 @@ DEFAULT_GROSS_EXPOSURE_FRACTION = 0.90
 DEFAULT_BUYING_POWER_USAGE_FRACTION = 0.50
 DEFAULT_MIN_LEG_NOTIONAL = 100.0
 DEFAULT_MAX_SIGNAL_STALENESS_DAYS = 3
+DEFAULT_PAIR_STOP_LOSS_FRACTION = 0.0
 REQUEST_TIMEOUT_SECONDS = 20
 
 
@@ -45,6 +47,9 @@ class AlpacaConfig:
     buying_power_usage_fraction: float
     min_leg_notional: float
     max_signal_staleness_days: int
+    flatten_on_no_targets: bool
+    pair_stop_loss_fraction: float
+    pair_denylist: List[str]
 
 
 def load_env_file(path: Path) -> None:
@@ -94,6 +99,15 @@ def parse_int_env(name: str, default: int) -> int:
         return default
 
 
+def parse_list_env(name: str) -> List[str]:
+    """Read a comma-separated environment variable into a normalized list."""
+    raw = os.getenv(name, "")
+    if not raw.strip():
+        return []
+    values = [value.strip() for value in raw.replace(";", ",").split(",")]
+    return [value for value in values if value]
+
+
 def load_config() -> AlpacaConfig:
     """Load Alpaca settings from environment variables."""
     load_env_file(ENV_FILE)
@@ -128,6 +142,9 @@ def load_config() -> AlpacaConfig:
             "ALPACA_MAX_SIGNAL_STALENESS_DAYS",
             DEFAULT_MAX_SIGNAL_STALENESS_DAYS,
         ),
+        flatten_on_no_targets=parse_bool_env("ALPACA_FLATTEN_ON_NO_TARGETS", False),
+        pair_stop_loss_fraction=max(parse_float_env("ALPACA_PAIR_STOP_LOSS_FRACTION", DEFAULT_PAIR_STOP_LOSS_FRACTION), 0.0),
+        pair_denylist=parse_list_env("ALPACA_PAIR_DENYLIST"),
     )
 
 
@@ -174,6 +191,8 @@ class AlpacaClient:
                 f"{response.status_code} {response.reason} for {method} {path}: {detail}",
                 response=response,
             )
+        if not response.content or not response.text.strip():
+            return {}
         return response.json()
 
     def get_account(self) -> Dict[str, object]:
@@ -187,6 +206,14 @@ class AlpacaClient:
     def get_order(self, order_id: str) -> Dict[str, object]:
         """Fetch one order by id."""
         return self.request("GET", f"/v2/orders/{order_id}")
+
+    def list_open_orders(self) -> List[Dict[str, object]]:
+        """Fetch currently open orders."""
+        return self.request("GET", "/v2/orders", {"status": "open", "direction": "desc", "limit": 500})
+
+    def cancel_order(self, order_id: str) -> None:
+        """Cancel one open order."""
+        self.request("DELETE", f"/v2/orders/{order_id}")
 
     def submit_order(self, symbol: str, qty: int, side: str, client_order_id: str) -> Dict[str, object]:
         """Submit a simple market order."""
@@ -390,7 +417,9 @@ def build_current_position_map(positions: List[Dict[str, object]]) -> Dict[str, 
         qty = int(round(safe_float(position.get("qty", 0.0))))
         side = str(position.get("side", "")).lower()
         if side == "short":
-            qty *= -1
+            qty = -abs(qty)
+        elif side == "long":
+            qty = abs(qty)
         current_positions[symbol] = qty
     return current_positions
 
@@ -399,8 +428,10 @@ def build_order_preview(
     leg_targets: pd.DataFrame,
     current_positions: Dict[str, int],
     managed_symbols: List[str],
+    flatten_symbols: Optional[Set[str]] = None,
 ) -> pd.DataFrame:
     """Build rebalance orders from desired and current shares."""
+    flatten_symbols = set(flatten_symbols or set())
     target_map = {
         str(row["symbol"]).upper(): {
             "target_qty": int(row["target_qty"]),
@@ -415,6 +446,8 @@ def build_order_preview(
     all_symbols = sorted(set(managed_symbols) | set(target_map.keys()))
 
     for symbol in all_symbols:
+        if symbol not in target_map and symbol not in flatten_symbols:
+            continue
         target_qty = int(target_map.get(symbol, {}).get("target_qty", 0))
         current_qty = int(current_positions.get(symbol, 0))
         delta_qty = target_qty - current_qty
@@ -519,20 +552,188 @@ def execute_orders(client: AlpacaClient, preview_df: pd.DataFrame) -> pd.DataFra
     return pd.DataFrame(execution_rows)
 
 
+def cancel_conflicting_open_orders(client: AlpacaClient, preview_df: pd.DataFrame) -> pd.DataFrame:
+    """Cancel open orders for symbols about to be rebalanced."""
+    if preview_df.empty:
+        return pd.DataFrame()
+
+    symbols_to_rebalance = set(preview_df["symbol"].astype(str).str.upper())
+    if not symbols_to_rebalance:
+        return pd.DataFrame()
+
+    cancelled_rows: List[Dict[str, object]] = []
+    for order in client.list_open_orders():
+        symbol = str(order.get("symbol", "")).upper()
+        if symbol not in symbols_to_rebalance:
+            continue
+
+        order_id = str(order.get("id", ""))
+        if not order_id:
+            continue
+
+        client.cancel_order(order_id)
+        cancelled_rows.append(
+            {
+                "cancelled_at": datetime.now().isoformat(timespec="seconds"),
+                "alpaca_order_id": order_id,
+                "symbol": symbol,
+                "side": str(order.get("side", "")),
+                "qty": safe_float(order.get("qty")),
+                "alpaca_status": str(order.get("status", "")),
+            }
+        )
+
+    return pd.DataFrame(cancelled_rows)
+
+
+def build_position_details_map(positions: List[Dict[str, object]]) -> Dict[str, Dict[str, float]]:
+    """Normalize current Alpaca positions for risk checks."""
+    position_details: Dict[str, Dict[str, float]] = {}
+    for position in positions:
+        symbol = str(position.get("symbol", "")).upper()
+        side = str(position.get("side", "")).lower()
+        qty = int(round(safe_float(position.get("qty", 0.0))))
+        if side == "short":
+            qty = -abs(qty)
+        elif side == "long":
+            qty = abs(qty)
+        position_details[symbol] = {
+            "qty": qty,
+            "avg_entry_price": safe_float(position.get("avg_entry_price")),
+            "current_price": safe_float(position.get("current_price")),
+        }
+    return position_details
+
+
+def estimate_pair_unrealized_pnl(pair_row: pd.Series, position_details: Dict[str, Dict[str, float]]) -> float:
+    """Estimate pair unrealized PnL from current Alpaca positions."""
+    long_symbol = str(pair_row.get("long_symbol", "")).upper()
+    short_symbol = str(pair_row.get("short_symbol", "")).upper()
+    long_target_qty = int(safe_float(pair_row.get("long_qty", 0)))
+    short_target_qty = int(safe_float(pair_row.get("short_qty", 0)))
+
+    long_position = position_details.get(long_symbol, {})
+    short_position = position_details.get(short_symbol, {})
+
+    long_current_qty = max(int(long_position.get("qty", 0)), 0)
+    short_current_qty = max(-int(short_position.get("qty", 0)), 0)
+
+    matched_long_qty = min(long_current_qty, long_target_qty)
+    matched_short_qty = min(short_current_qty, short_target_qty)
+    if matched_long_qty <= 0 and matched_short_qty <= 0:
+        return float("nan")
+
+    pnl = 0.0
+    if matched_long_qty > 0:
+        pnl += (safe_float(long_position.get("current_price")) - safe_float(long_position.get("avg_entry_price"))) * matched_long_qty
+    if matched_short_qty > 0:
+        pnl += (safe_float(short_position.get("avg_entry_price")) - safe_float(short_position.get("current_price"))) * matched_short_qty
+    return pnl
+
+
+def build_pair_risk_rows(
+    pair_trade_plan: pd.DataFrame,
+    position_details: Dict[str, Dict[str, float]],
+    account_equity: float,
+    config: AlpacaConfig,
+) -> pd.DataFrame:
+    """Detect pair stop-loss breaches from current unrealized PnL."""
+    if pair_trade_plan.empty or config.pair_stop_loss_fraction <= 0 or not np.isfinite(account_equity) or account_equity <= 0:
+        return pd.DataFrame()
+
+    stop_threshold = -account_equity * config.pair_stop_loss_fraction
+    risk_rows: List[Dict[str, object]] = []
+
+    for _, row in pair_trade_plan.iterrows():
+        estimated_pnl = estimate_pair_unrealized_pnl(row, position_details)
+        if not np.isfinite(estimated_pnl) or estimated_pnl > stop_threshold:
+            continue
+
+        risk_rows.append(
+            {
+                "event_at": datetime.now().isoformat(timespec="seconds"),
+                "latest_date": row["signal_date"],
+                "pair": row["pair"],
+                "event_type": "STOP_LOSS",
+                "event_value": estimated_pnl,
+                "threshold_value": stop_threshold,
+                "notes": f"Estimated unrealized PnL {estimated_pnl:.2f} breached threshold {stop_threshold:.2f}.",
+            }
+        )
+
+    return pd.DataFrame(risk_rows)
+
+
+def upsert_risk_rows(path: Path, new_rows: pd.DataFrame) -> None:
+    """Append risk rows while replacing duplicate pair/date/event entries."""
+    if new_rows.empty:
+        return
+
+    key_cols = ["latest_date", "pair", "event_type"]
+    if path.exists():
+        existing = pd.read_csv(path)
+        new_rows = pd.concat([existing, new_rows], ignore_index=True)
+        new_rows = new_rows.drop_duplicates(subset=key_cols, keep="last")
+
+    new_rows.to_csv(path, index=False)
+
+
+def load_pair_risk_rows(path: Path) -> pd.DataFrame:
+    """Load prior pair risk events if present."""
+    return load_csv(path)
+
+
+def get_pairs_in_cooldown(ready_universe: pd.DataFrame, risk_rows: pd.DataFrame) -> Set[str]:
+    """Block re-entry for pairs stopped earlier in the same signal cycle."""
+    if ready_universe.empty or risk_rows.empty:
+        return set()
+
+    cooldown_pairs: Set[str] = set()
+    for _, row in ready_universe.iterrows():
+        pair = str(row.get("pair", ""))
+        latest_date = str(row.get("latest_date", ""))
+        matches = risk_rows[
+            (risk_rows["pair"].astype(str) == pair)
+            & (risk_rows["latest_date"].astype(str) == latest_date)
+            & (risk_rows["event_type"].astype(str) == "STOP_LOSS")
+        ]
+        if not matches.empty:
+            cooldown_pairs.add(pair)
+
+    return cooldown_pairs
+
+
+def filter_blocked_pairs(ready_universe: pd.DataFrame, blocked_pairs: Set[str]) -> pd.DataFrame:
+    """Remove blocked pairs from the active trading universe."""
+    if ready_universe.empty or not blocked_pairs:
+        return ready_universe
+    return ready_universe[~ready_universe["pair"].astype(str).isin(blocked_pairs)].copy()
+
+
 def build_trade_log_rows(pair_trade_plan: pd.DataFrame, execution_df: pd.DataFrame) -> pd.DataFrame:
     """Summarize each executed pair trade in one clear log row."""
     if pair_trade_plan.empty or execution_df.empty:
         return pd.DataFrame()
 
+    expanded_execution = execution_df.copy()
+    expanded_execution["pair"] = expanded_execution["source_pairs"].fillna("").astype(str).str.split(
+        " | ",
+        regex=False,
+    )
+    expanded_execution = expanded_execution.explode("pair")
+    expanded_execution["pair"] = expanded_execution["pair"].astype(str).str.strip()
+    expanded_execution = expanded_execution[expanded_execution["pair"] != ""]
+    if expanded_execution.empty:
+        return pd.DataFrame()
+
     execution_map = (
-        execution_df.groupby("source_pairs", as_index=False)
+        expanded_execution.groupby("pair", as_index=False)
         .agg(
             submitted_at=("submitted_at", "first"),
             order_count=("alpaca_order_id", "count"),
             alpaca_status=("alpaca_status", lambda values: "|".join(sorted(set(map(str, values))))),
             order_ids=("alpaca_order_id", lambda values: "|".join(map(str, values))),
         )
-        .rename(columns={"source_pairs": "pair"})
     )
 
     trade_log = pair_trade_plan.merge(execution_map, on="pair", how="inner")
@@ -712,6 +913,17 @@ def main() -> None:
     if not np.isfinite(deployable_capital) or deployable_capital <= 0:
         raise ValueError("No deployable capital is available from equity/buying power constraints.")
 
+    initial_pair_trade_plan = build_pair_trade_plan(ready_universe, deployable_capital, config)
+    position_details = build_position_details_map(positions)
+    new_risk_rows = build_pair_risk_rows(initial_pair_trade_plan, position_details, account_equity, config)
+    if not new_risk_rows.empty:
+        upsert_risk_rows(PAIR_RISK_EVENTS_LOG_OUTPUT, new_risk_rows)
+    risk_rows = load_pair_risk_rows(PAIR_RISK_EVENTS_LOG_OUTPUT)
+
+    blocked_pairs = set(config.pair_denylist)
+    blocked_pairs.update(get_pairs_in_cooldown(ready_universe, risk_rows))
+    ready_universe = filter_blocked_pairs(ready_universe, blocked_pairs)
+
     leg_targets = build_leg_targets(ready_universe, deployable_capital, config)
     pair_trade_plan = build_pair_trade_plan(ready_universe, deployable_capital, config)
     pair_lifecycle_df = build_pair_lifecycle_rows(ready_universe, pair_trade_plan)
@@ -722,14 +934,30 @@ def main() -> None:
     append_csv_rows(POSITIONS_SNAPSHOT_LOG_OUTPUT, positions_snapshot_df)
     append_csv_rows(PAIR_LIFECYCLE_LOG_OUTPUT, pair_lifecycle_df)
 
-    if leg_targets.empty or pair_trade_plan.empty:
-        raise ValueError("No executable target legs were produced from the ready pairs.")
-
-    managed_symbols = sorted(
-        set(ready_universe["stock_x"].astype(str).str.upper()) | set(ready_universe["stock_y"].astype(str).str.upper())
+    all_managed_symbols = sorted(
+        set(load_csv(READY_SIGNALS_INPUT).merge(load_csv(RANKED_PAIRS_INPUT)[["sector", "pair", "stock_x", "stock_y"]], on=["sector", "pair"], how="left")["stock_x"].astype(str).str.upper())
+        | set(load_csv(READY_SIGNALS_INPUT).merge(load_csv(RANKED_PAIRS_INPUT)[["sector", "pair", "stock_x", "stock_y"]], on=["sector", "pair"], how="left")["stock_y"].astype(str).str.upper())
     )
+    flatten_symbols: Set[str] = set()
+    if blocked_pairs:
+        blocked_rows = load_csv(READY_SIGNALS_INPUT).merge(
+            load_csv(RANKED_PAIRS_INPUT)[["sector", "pair", "stock_x", "stock_y"]],
+            on=["sector", "pair"],
+            how="left",
+        )
+        blocked_rows = blocked_rows[blocked_rows["pair"].astype(str).isin(blocked_pairs)]
+        flatten_symbols.update(blocked_rows["stock_x"].astype(str).str.upper())
+        flatten_symbols.update(blocked_rows["stock_y"].astype(str).str.upper())
+    if config.flatten_on_no_targets and leg_targets.empty:
+        flatten_symbols.update(all_managed_symbols)
+
     current_positions = build_current_position_map(positions)
-    preview_df = build_order_preview(leg_targets, current_positions, managed_symbols)
+    preview_df = build_order_preview(
+        leg_targets,
+        current_positions,
+        all_managed_symbols,
+        flatten_symbols=flatten_symbols,
+    )
     preview_df.to_csv(ORDER_PREVIEW_OUTPUT, index=False)
 
     print(f"Account equity: ${account_equity:,.2f}")
@@ -737,6 +965,13 @@ def main() -> None:
         print(f"Account buying power: ${account_buying_power:,.2f}")
     print(f"Deployable capital: ${deployable_capital:,.2f}")
     print(f"Preview saved to: {ORDER_PREVIEW_OUTPUT.resolve()}")
+    if blocked_pairs:
+        print(f"Blocked pairs this cycle: {', '.join(sorted(blocked_pairs))}")
+    if leg_targets.empty or pair_trade_plan.empty:
+        if config.flatten_on_no_targets:
+            print("No executable target legs were produced from the ready pairs. Managed symbols will be flattened.")
+        else:
+            print("No executable target legs were produced from the ready pairs. Existing positions will be left unchanged.")
     if staleness_days > config.max_signal_staleness_days:
         latest_signal_date = pd.to_datetime(ready_signals["latest_date"]).max().date().isoformat()
         print(
@@ -760,6 +995,10 @@ def main() -> None:
             f"Ready signals are stale by {staleness_days} days. "
             f"Rerun pair_checker.py and paper_trading_ready.py first, or pass --allow-stale to override."
         )
+
+    cancelled_orders_df = cancel_conflicting_open_orders(client, preview_df)
+    if not cancelled_orders_df.empty:
+        print(f"Cancelled {len(cancelled_orders_df)} open order(s) that conflicted with this rebalance.")
 
     execution_df = execute_orders(client, preview_df)
     if execution_df.empty:
