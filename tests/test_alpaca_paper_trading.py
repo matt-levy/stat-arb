@@ -6,11 +6,13 @@ import pandas as pd
 from alpaca_paper_trading import (
     AlpacaClient,
     AlpacaConfig,
+    build_client_order_id,
     build_order_preview,
     build_pair_risk_rows,
     build_trade_log_rows,
     cancel_conflicting_open_orders,
     filter_blocked_pairs,
+    get_pairs_already_submitted_this_cycle,
     get_pairs_in_cooldown,
 )
 
@@ -168,6 +170,52 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         filtered = filter_blocked_pairs(ready_universe, {"C vs GS"})
 
         self.assertEqual(list(filtered["pair"]), ["MU vs LRCX"])
+
+    def test_get_pairs_already_submitted_this_cycle_blocks_matching_signal_date(self):
+        ready_universe = pd.DataFrame(
+            [
+                {"pair": "C vs GS", "latest_date": "2026-04-13"},
+                {"pair": "MU vs LRCX", "latest_date": "2026-04-13"},
+                {"pair": "JPM vs GS", "latest_date": "2026-04-14"},
+            ]
+        )
+        trade_log = pd.DataFrame(
+            [
+                {"pair": "C vs GS", "signal_date": "2026-04-13", "alpaca_status": "accepted"},
+                {"pair": "MU vs LRCX", "signal_date": "2026-04-12", "alpaca_status": "accepted"},
+                {"pair": "JPM vs GS", "signal_date": "2026-04-14", "alpaca_status": "rejected"},
+            ]
+        )
+
+        already_submitted = get_pairs_already_submitted_this_cycle(ready_universe, trade_log)
+
+        self.assertEqual(already_submitted, {"C vs GS"})
+
+    def test_build_client_order_id_is_stable_for_same_target(self):
+        first = build_client_order_id(
+            signal_date="2026-04-14",
+            symbol="C",
+            side="buy",
+            target_qty=-7,
+            source_pairs="C vs GS",
+        )
+        second = build_client_order_id(
+            signal_date="2026-04-14",
+            symbol="C",
+            side="buy",
+            target_qty=-7,
+            source_pairs="C vs GS",
+        )
+        changed = build_client_order_id(
+            signal_date="2026-04-14",
+            symbol="C",
+            side="buy",
+            target_qty=-8,
+            source_pairs="C vs GS",
+        )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, changed)
 
 
 if __name__ == "__main__":

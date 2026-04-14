@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import os
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -33,6 +34,16 @@ DEFAULT_MIN_LEG_NOTIONAL = 100.0
 DEFAULT_MAX_SIGNAL_STALENESS_DAYS = 3
 DEFAULT_PAIR_STOP_LOSS_FRACTION = 0.0
 REQUEST_TIMEOUT_SECONDS = 20
+ACTIVE_EXECUTION_STATUSES = {
+    "accepted",
+    "calculated",
+    "done_for_day",
+    "filled",
+    "held",
+    "new",
+    "partially_filled",
+    "pending_new",
+}
 
 
 @dataclass
@@ -246,6 +257,65 @@ def build_ready_universe(ready_signals: pd.DataFrame, ranked_pairs: pd.DataFrame
     merged = ready_signals.merge(ranked_pairs[leg_columns], on=["sector", "pair"], how="left")
     merged = merged.dropna(subset=["stock_x", "stock_y"]).copy()
     return merged
+
+
+def get_pairs_already_submitted_this_cycle(ready_universe: pd.DataFrame, trade_log: pd.DataFrame) -> Set[str]:
+    """Return pairs that were already submitted for the same signal date."""
+    if ready_universe.empty or trade_log.empty:
+        return set()
+    if "pair" not in trade_log.columns or "signal_date" not in trade_log.columns or "alpaca_status" not in trade_log.columns:
+        return set()
+
+    normalized_log = trade_log.copy()
+    normalized_log["pair"] = normalized_log["pair"].astype(str).str.strip()
+    normalized_log["signal_date"] = normalized_log["signal_date"].astype(str).str.strip()
+    normalized_log["alpaca_status"] = normalized_log["alpaca_status"].fillna("").astype(str)
+
+    executed_pairs: Set[str] = set()
+    for _, row in ready_universe.iterrows():
+        pair = str(row.get("pair", "")).strip()
+        latest_date = str(row.get("latest_date", "")).strip()
+        if not pair or not latest_date:
+            continue
+
+        matches = normalized_log[
+            (normalized_log["pair"] == pair)
+            & (normalized_log["signal_date"] == latest_date)
+        ]
+        if matches.empty:
+            continue
+
+        for raw_status in matches["alpaca_status"]:
+            statuses = {status.strip().lower() for status in str(raw_status).split("|") if status.strip()}
+            if statuses & ACTIVE_EXECUTION_STATUSES:
+                executed_pairs.add(pair)
+                break
+
+    return executed_pairs
+
+
+def build_client_order_id(
+    signal_date: str,
+    symbol: str,
+    side: str,
+    target_qty: int,
+    source_pairs: str,
+) -> str:
+    """Build a deterministic client order id for one target state."""
+    normalized_date = str(signal_date).replace("-", "")[:8] or "nodate"
+    normalized_symbol = str(symbol).upper().strip()[:8] or "nosym"
+    normalized_side = str(side).lower().strip()[:4] or "side"
+    payload = "|".join(
+        [
+            str(signal_date).strip(),
+            normalized_symbol,
+            normalized_side,
+            str(int(target_qty)),
+            str(source_pairs).strip(),
+        ]
+    )
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    return f"pairs-{normalized_date}-{normalized_symbol.lower()}-{normalized_side}-{digest}"
 
 
 def determine_deployable_capital(account: Dict[str, object], config: AlpacaConfig) -> float:
@@ -491,24 +561,31 @@ def print_order_preview(preview_df: pd.DataFrame) -> None:
     )
 
 
-def execute_orders(client: AlpacaClient, preview_df: pd.DataFrame) -> pd.DataFrame:
+def execute_orders(client: AlpacaClient, preview_df: pd.DataFrame, signal_date: str) -> pd.DataFrame:
     """Submit preview orders to Alpaca and capture responses."""
     if preview_df.empty:
         return pd.DataFrame()
 
     execution_rows: List[Dict[str, object]] = []
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-
     for index, row in preview_df.reset_index(drop=True).iterrows():
         symbol = str(row["symbol"]).upper()
         side = str(row["side"])
         qty = int(row["order_qty"])
+        target_qty = int(row["target_qty"])
+        source_pairs = str(row.get("source_pairs", ""))
+        client_order_id = build_client_order_id(
+            signal_date=signal_date,
+            symbol=symbol,
+            side=side,
+            target_qty=target_qty,
+            source_pairs=source_pairs,
+        )
         try:
             response = client.submit_order(
                 symbol=symbol,
                 qty=qty,
                 side=side,
-                client_order_id=f"pairs-{timestamp}-{index + 1}-{symbol}".lower(),
+                client_order_id=client_order_id,
             )
             execution_rows.append(
                 {
@@ -516,15 +593,16 @@ def execute_orders(client: AlpacaClient, preview_df: pd.DataFrame) -> pd.DataFra
                     "symbol": symbol,
                     "side": side,
                     "order_qty": qty,
-                    "target_qty": int(row["target_qty"]),
+                    "target_qty": target_qty,
                     "current_qty": int(row["current_qty"]),
                     "alpaca_order_id": response.get("id", ""),
+                    "client_order_id": client_order_id,
                     "alpaca_status": response.get("status", ""),
                     "filled_qty": safe_float(response.get("filled_qty")),
                     "filled_avg_price": safe_float(response.get("filled_avg_price")),
                     "created_at": response.get("created_at", ""),
                     "updated_at": response.get("updated_at", ""),
-                    "source_pairs": row["source_pairs"],
+                    "source_pairs": source_pairs,
                     "error": "",
                 }
             )
@@ -535,15 +613,16 @@ def execute_orders(client: AlpacaClient, preview_df: pd.DataFrame) -> pd.DataFra
                     "symbol": symbol,
                     "side": side,
                     "order_qty": qty,
-                    "target_qty": int(row["target_qty"]),
+                    "target_qty": target_qty,
                     "current_qty": int(row["current_qty"]),
                     "alpaca_order_id": "",
+                    "client_order_id": client_order_id,
                     "alpaca_status": "rejected",
                     "filled_qty": float("nan"),
                     "filled_avg_price": float("nan"),
                     "created_at": "",
                     "updated_at": "",
-                    "source_pairs": row["source_pairs"],
+                    "source_pairs": source_pairs,
                     "error": str(exc),
                 }
             )
@@ -845,6 +924,8 @@ def build_order_fill_rows(execution_df: pd.DataFrame) -> pd.DataFrame:
         "symbol",
         "side",
         "order_qty",
+        "target_qty",
+        "client_order_id",
         "alpaca_order_id",
         "alpaca_status",
         "filled_qty",
@@ -919,10 +1000,12 @@ def main() -> None:
     if not new_risk_rows.empty:
         upsert_risk_rows(PAIR_RISK_EVENTS_LOG_OUTPUT, new_risk_rows)
     risk_rows = load_pair_risk_rows(PAIR_RISK_EVENTS_LOG_OUTPUT)
+    prior_trade_log = load_csv(TRADE_LOG_OUTPUT)
 
     blocked_pairs = set(config.pair_denylist)
     blocked_pairs.update(get_pairs_in_cooldown(ready_universe, risk_rows))
-    ready_universe = filter_blocked_pairs(ready_universe, blocked_pairs)
+    already_submitted_pairs = get_pairs_already_submitted_this_cycle(ready_universe, prior_trade_log)
+    ready_universe = filter_blocked_pairs(ready_universe, blocked_pairs | already_submitted_pairs)
 
     leg_targets = build_leg_targets(ready_universe, deployable_capital, config)
     pair_trade_plan = build_pair_trade_plan(ready_universe, deployable_capital, config)
@@ -967,6 +1050,8 @@ def main() -> None:
     print(f"Preview saved to: {ORDER_PREVIEW_OUTPUT.resolve()}")
     if blocked_pairs:
         print(f"Blocked pairs this cycle: {', '.join(sorted(blocked_pairs))}")
+    if already_submitted_pairs:
+        print(f"Already submitted this signal cycle: {', '.join(sorted(already_submitted_pairs))}")
     if leg_targets.empty or pair_trade_plan.empty:
         if config.flatten_on_no_targets:
             print("No executable target legs were produced from the ready pairs. Managed symbols will be flattened.")
@@ -1000,7 +1085,8 @@ def main() -> None:
     if not cancelled_orders_df.empty:
         print(f"Cancelled {len(cancelled_orders_df)} open order(s) that conflicted with this rebalance.")
 
-    execution_df = execute_orders(client, preview_df)
+    latest_signal_date = pd.to_datetime(ready_signals["latest_date"]).max().date().isoformat()
+    execution_df = execute_orders(client, preview_df, signal_date=latest_signal_date)
     if execution_df.empty:
         print("No orders were submitted.")
         return
