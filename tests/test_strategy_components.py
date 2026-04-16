@@ -1,108 +1,253 @@
 import unittest
+from unittest.mock import patch
 
-import numpy as np
 import pandas as pd
 
-from backtest import compute_trading_cost, run_backtest, total_trading_cost_rate
-from config import MAX_HOLD_DAYS, MAX_PAIR_WEIGHT
-from portfolio import normalize_capped_weights, weight_from_row
-from signals import compute_pair_filters, generate_strategy_state, get_entry_decision, get_latest_signal
+from paper_trading_ready import build_ready_pairs, normalize_capped_weights, weight_from_row
+from run_pipeline import main as run_pipeline_main
 
 
-def make_price_df(length: int = 260, seed: int = 7) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    dates = pd.date_range("2023-01-01", periods=length, freq="B")
-    x = 100 + np.cumsum(rng.normal(0.1, 0.8, length))
-    spread = np.sin(np.linspace(0, 8, length)) * 1.5 + rng.normal(0, 0.25, length)
-    y = 1.1 * x + spread
-    return pd.DataFrame({"Y": y, "X": x}, index=dates)
+class ReadySignalTests(unittest.TestCase):
+    def test_weight_from_row_rewards_stronger_research_inputs(self):
+        weak_row = {
+            "score": 1.0,
+            "confidence_score": 2.0,
+            "robustness_score": 3.0,
+            "oos_sharpe": 0.5,
+            "oos_annualized_return": 0.05,
+        }
+        strong_row = {
+            "score": 3.0,
+            "confidence_score": 4.0,
+            "robustness_score": 5.0,
+            "oos_sharpe": 1.5,
+            "oos_annualized_return": 0.15,
+        }
 
+        self.assertGreater(weight_from_row(strong_row), weight_from_row(weak_row))
 
-class StrategyComponentTests(unittest.TestCase):
-    def test_cost_model_charges_expected_entry_and_exit_costs(self):
-        traded_notional = 100_000.0
-        expected_cost = traded_notional * total_trading_cost_rate()
+    def test_normalize_capped_weights_respects_cap_and_sums_to_one(self):
+        weights = normalize_capped_weights(pd.Series([10.0, 5.0, 1.0]), cap=0.50)
 
-        entry_cost = compute_trading_cost(traded_notional)
-        exit_cost = compute_trading_cost(traded_notional)
+        self.assertAlmostEqual(weights.sum(), 1.0)
+        self.assertLessEqual(weights.max(), 0.50 + 1e-9)
 
-        self.assertAlmostEqual(entry_cost, expected_cost)
-        self.assertAlmostEqual(exit_cost, expected_cost)
-        self.assertAlmostEqual(entry_cost + exit_cost, expected_cost * 2)
-
-    def test_volatility_aware_sizing_normalizes_and_respects_caps(self):
-        low_vol_weight = weight_from_row(
-            {
-                "test_sharpe": 1.0,
-                "train_sharpe": 0.5,
-                "test_return": 0.10,
-                "correlation": 0.7,
-                "test_dd": -0.05,
-                "recent_spread_vol_ratio": 1.0,
-            }
+    def test_build_ready_pairs_keeps_only_ready_pairs_and_limits_count(self):
+        live_signals = pd.DataFrame(
+            [
+                {
+                    "latest_date": "2026-04-15",
+                    "sector": "banks",
+                    "pair": "C vs GS",
+                    "live_recommendation": "PAPER_TRADE_READY",
+                    "current_action": "SHORT_SPREAD",
+                    "current_position": -1,
+                    "live_zscore": 2.8,
+                    "live_beta": 1.0,
+                    "live_half_life": 10.0,
+                    "passes_live_stability": True,
+                    "live_stability_reason": "",
+                    "latest_price_x": 130.0,
+                    "latest_price_y": 900.0,
+                },
+                {
+                    "latest_date": "2026-04-15",
+                    "sector": "banks",
+                    "pair": "JPM vs GS",
+                    "live_recommendation": "PAPER_TRADE_READY",
+                    "current_action": "SHORT_SPREAD",
+                    "current_position": -1,
+                    "live_zscore": 1.5,
+                    "live_beta": 0.45,
+                    "live_half_life": 14.0,
+                    "passes_live_stability": True,
+                    "live_stability_reason": "",
+                    "latest_price_x": 300.0,
+                    "latest_price_y": 900.0,
+                },
+                {
+                    "latest_date": "2026-04-15",
+                    "sector": "semis",
+                    "pair": "MU vs LRCX",
+                    "live_recommendation": "PAPER_TRADE_READY",
+                    "current_action": "LONG_SPREAD",
+                    "current_position": 1,
+                    "live_zscore": -1.2,
+                    "live_beta": 1.4,
+                    "live_half_life": 7.0,
+                    "passes_live_stability": True,
+                    "live_stability_reason": "",
+                    "latest_price_x": 450.0,
+                    "latest_price_y": 265.0,
+                },
+                {
+                    "latest_date": "2026-04-15",
+                    "sector": "oil",
+                    "pair": "XOM vs CVX",
+                    "live_recommendation": "WATCHLIST",
+                    "current_action": "HOLD",
+                    "current_position": 0,
+                    "live_zscore": 0.2,
+                    "live_beta": 1.1,
+                    "live_half_life": 9.0,
+                    "passes_live_stability": True,
+                    "live_stability_reason": "",
+                    "latest_price_x": 100.0,
+                    "latest_price_y": 150.0,
+                },
+            ]
         )
-        high_vol_weight = weight_from_row(
-            {
-                "test_sharpe": 1.0,
-                "train_sharpe": 0.5,
-                "test_return": 0.10,
-                "correlation": 0.7,
-                "test_dd": -0.05,
-                "recent_spread_vol_ratio": 2.0,
-            }
+        ranked_pairs = pd.DataFrame(
+            [
+                {
+                    "sector": "banks",
+                    "pair": "C vs GS",
+                    "research_verdict": "PASS",
+                    "research_recommendation": "TRADE",
+                    "score": 9.0,
+                    "confidence_score": 10.0,
+                    "confidence_rank": 1,
+                    "robustness_score": 9.5,
+                    "robustness_pass_rate": 1.0,
+                    "oos_sharpe": 1.7,
+                    "oos_return": 0.40,
+                    "oos_annualized_return": 0.55,
+                    "oos_max_drawdown": -0.06,
+                    "oos_trades": 15,
+                    "oos_unique_test_days": 200,
+                    "avg_coint_pvalue_passed": 0.02,
+                    "avg_adf_pvalue_passed": 0.01,
+                    "avg_half_life_passed": 8.0,
+                },
+                {
+                    "sector": "banks",
+                    "pair": "JPM vs GS",
+                    "research_verdict": "PASS",
+                    "research_recommendation": "TRADE",
+                    "score": 6.0,
+                    "confidence_score": 7.0,
+                    "confidence_rank": 2,
+                    "robustness_score": 7.5,
+                    "robustness_pass_rate": 0.9,
+                    "oos_sharpe": 1.2,
+                    "oos_return": 0.12,
+                    "oos_annualized_return": 0.10,
+                    "oos_max_drawdown": -0.04,
+                    "oos_trades": 8,
+                    "oos_unique_test_days": 150,
+                    "avg_coint_pvalue_passed": 0.03,
+                    "avg_adf_pvalue_passed": 0.02,
+                    "avg_half_life_passed": 9.0,
+                },
+                {
+                    "sector": "semis",
+                    "pair": "MU vs LRCX",
+                    "research_verdict": "PASS",
+                    "research_recommendation": "TRADE",
+                    "score": 5.0,
+                    "confidence_score": 8.0,
+                    "confidence_rank": 1,
+                    "robustness_score": 8.5,
+                    "robustness_pass_rate": 0.95,
+                    "oos_sharpe": 0.8,
+                    "oos_return": 0.18,
+                    "oos_annualized_return": 0.14,
+                    "oos_max_drawdown": -0.15,
+                    "oos_trades": 17,
+                    "oos_unique_test_days": 300,
+                    "avg_coint_pvalue_passed": 0.04,
+                    "avg_adf_pvalue_passed": 0.01,
+                    "avg_half_life_passed": 7.0,
+                },
+                {
+                    "sector": "tech",
+                    "pair": "AAPL vs MSFT",
+                    "research_verdict": "PASS",
+                    "research_recommendation": "TRADE",
+                    "score": 12.0,
+                    "confidence_score": 12.0,
+                    "confidence_rank": 1,
+                    "robustness_score": 12.0,
+                    "robustness_pass_rate": 1.0,
+                    "oos_sharpe": 2.0,
+                    "oos_return": 0.60,
+                    "oos_annualized_return": 0.75,
+                    "oos_max_drawdown": -0.03,
+                    "oos_trades": 25,
+                    "oos_unique_test_days": 240,
+                    "avg_coint_pvalue_passed": 0.01,
+                    "avg_adf_pvalue_passed": 0.01,
+                    "avg_half_life_passed": 6.0,
+                },
+            ]
         )
 
-        normalized = normalize_capped_weights(pd.Series([10.0, 5.0, 3.0]), cap=MAX_PAIR_WEIGHT)
+        ready_pairs = build_ready_pairs(live_signals, ranked_pairs)
 
-        self.assertGreater(low_vol_weight, high_vol_weight)
-        self.assertAlmostEqual(normalized.sum(), 1.0)
-        self.assertLessEqual(normalized.max(), MAX_PAIR_WEIGHT + 1e-9)
+        self.assertEqual(list(ready_pairs["pair"]), ["C vs GS", "JPM vs GS", "MU vs LRCX"])
+        self.assertAlmostEqual(float(ready_pairs["portfolio_weight"].sum()), 1.0)
+        self.assertLessEqual(float(ready_pairs["portfolio_weight"].max()), 0.50 + 1e-9)
+        self.assertNotIn("XOM vs CVX", set(ready_pairs["pair"]))
 
-    def test_extreme_z_entries_are_rejected(self):
-        signal, reason = get_entry_decision(current_z=-4.2, previous_z=-5.0, hl_ok=True)
-        self.assertEqual(signal, 0)
-        self.assertEqual(reason, "EXTREME_Z_REJECT")
-
-    def test_time_based_exit_triggers_at_max_hold_limit(self):
-        dates = pd.date_range("2024-01-01", periods=MAX_HOLD_DAYS + 3, freq="B")
-        signal_df = pd.DataFrame(
-            {
-                "z": [-3.2, -2.6] + [-1.8] * (MAX_HOLD_DAYS + 1),
-                "hl_ok": [True] * (MAX_HOLD_DAYS + 3),
-            },
-            index=dates,
+    def test_build_ready_pairs_returns_empty_without_matching_inputs(self):
+        live_signals = pd.DataFrame(
+            [
+                {
+                    "latest_date": "2026-04-15",
+                    "sector": "banks",
+                    "pair": "C vs GS",
+                    "live_recommendation": "WATCHLIST",
+                }
+            ]
+        )
+        ranked_pairs = pd.DataFrame(
+            [
+                {
+                    "sector": "banks",
+                    "pair": "C vs GS",
+                    "research_verdict": "PASS",
+                    "research_recommendation": "TRADE",
+                    "score": 9.0,
+                    "confidence_score": 10.0,
+                    "confidence_rank": 1,
+                    "robustness_score": 9.5,
+                    "robustness_pass_rate": 1.0,
+                    "oos_sharpe": 1.7,
+                    "oos_return": 0.40,
+                    "oos_annualized_return": 0.55,
+                    "oos_max_drawdown": -0.06,
+                    "oos_trades": 15,
+                    "oos_unique_test_days": 200,
+                    "avg_coint_pvalue_passed": 0.02,
+                    "avg_adf_pvalue_passed": 0.01,
+                    "avg_half_life_passed": 8.0,
+                }
+            ]
         )
 
-        state_df = generate_strategy_state(signal_df)
-        time_stop_rows = state_df[state_df["exit_reason"] == "TIME_STOP"]
+        ready_pairs = build_ready_pairs(live_signals, ranked_pairs)
 
-        self.assertFalse(time_stop_rows.empty)
-        self.assertEqual(time_stop_rows.iloc[0]["action_type"], "EXIT")
+        self.assertTrue(ready_pairs.empty)
 
-    def test_shared_signal_logic_matches_backtest_and_latest_signal(self):
-        price_df = make_price_df()
 
-        latest_signal = get_latest_signal(price_df, "Y", "X")
-        backtest_df = run_backtest(price_df, "Y", "X")
+class RunPipelineTests(unittest.TestCase):
+    @patch("run_pipeline.run_step")
+    @patch("sys.argv", ["run_pipeline.py", "--skip-research", "--skip-ready", "--execute", "--allow-stale"])
+    def test_main_only_runs_alpaca_step_with_requested_flags(self, run_step_mock):
+        run_pipeline_main()
 
-        self.assertIsNotNone(latest_signal)
-        self.assertEqual(latest_signal["position"], int(backtest_df["pos"].iloc[-1]))
-        self.assertEqual(latest_signal["action_type"], backtest_df["action_type"].iloc[-1])
-        self.assertEqual(latest_signal["exit_reason"], backtest_df["exit_reason"].iloc[-1])
+        run_step_mock.assert_called_once()
+        command, label = run_step_mock.call_args.args
+        self.assertEqual(label, "Alpaca")
+        self.assertEqual(command[1:], ["alpaca_paper_trading.py", "--execute", "--allow-stale"])
 
-    def test_stability_filters_reject_unstable_input(self):
-        rng = np.random.default_rng(11)
-        dates = pd.date_range("2023-01-01", periods=280, freq="B")
-        x = 100 + np.cumsum(rng.normal(0.0, 1.0, len(dates)))
-        stable_y = x[:180] + rng.normal(0.0, 0.5, 180)
-        unstable_tail = 140 + np.cumsum(rng.normal(0.0, 4.0, len(dates) - 180))
-        y = np.concatenate([stable_y, unstable_tail])
-        df = pd.DataFrame({"Y": y, "X": x}, index=dates)
+    @patch("run_pipeline.run_step")
+    @patch("sys.argv", ["run_pipeline.py"])
+    def test_main_runs_all_pipeline_steps_by_default(self, run_step_mock):
+        run_pipeline_main()
 
-        filters = compute_pair_filters(df, "Y", "X")
-
-        self.assertFalse(filters["passes_stability"])
-        self.assertTrue(filters["stability_rejection_reason"])
+        labels = [call.args[1] for call in run_step_mock.call_args_list]
+        self.assertEqual(labels, ["Research", "Ready Signals", "Alpaca"])
 
 
 if __name__ == "__main__":
