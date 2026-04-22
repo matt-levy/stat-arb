@@ -3,7 +3,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
-from project_paths import OUTPUTS_DIR, REPORTS_DIR, PLOTS_DIR, ensure_project_directories
+from project_paths import DATA_DIR, OUTPUTS_DIR, REPORTS_DIR, PLOTS_DIR, ensure_project_directories
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -82,6 +82,9 @@ LIVE_LEG_CONTRIBUTION_WINDOW = 20
 LIVE_MAX_DOMINANT_LEG_SHARE = 0.80
 LIVE_HARD_MAX_DOMINANT_LEG_SHARE = 0.90
 LIVE_STRONG_CORR_OVERRIDE = 0.85
+EVENT_CALENDAR_CSV = DATA_DIR / "earnings_events.csv"
+EVENT_POST_COOLDOWN_BUSINESS_DAYS = 3
+EVENT_PRE_BLOCK_BUSINESS_DAYS = 1
 
 SCORE_SHARPE_WEIGHT = 4.0
 SCORE_RETURN_WEIGHT = 1.5
@@ -204,6 +207,39 @@ def download_prices(tickers: List[str], start: str, end: str) -> pd.DataFrame:
 
     data = data.sort_index()
     return data.astype(float)
+
+
+def load_event_calendar(path: Path = EVENT_CALENDAR_CSV) -> pd.DataFrame:
+    """Load a free/public manually maintained event calendar."""
+    if not path.exists():
+        return pd.DataFrame(columns=["symbol", "event_date", "event_type", "source", "notes"])
+
+    events = pd.read_csv(path)
+    if events.empty:
+        return events
+
+    required_columns = ["symbol", "event_date", "event_type"]
+    missing_columns = [column for column in required_columns if column not in events.columns]
+    if missing_columns:
+        raise ValueError(f"Event calendar missing required columns: {', '.join(missing_columns)}")
+
+    events = events.copy()
+    events["symbol"] = events["symbol"].astype(str).str.upper().str.strip()
+    events["event_type"] = events["event_type"].astype(str).str.lower().str.strip()
+    events["event_date"] = pd.to_datetime(events["event_date"], errors="coerce")
+    events = events.dropna(subset=["symbol", "event_date"])
+    return events
+
+
+def business_days_between(start_date: pd.Timestamp, end_date: pd.Timestamp) -> int:
+    """Count weekdays between two dates, excluding the start date."""
+    start_day = pd.Timestamp(start_date).date()
+    end_day = pd.Timestamp(end_date).date()
+    if start_day == end_day:
+        return 0
+    if start_day < end_day:
+        return int(np.busday_count(start_day, end_day))
+    return -int(np.busday_count(end_day, start_day))
 
 
 def safe_float(value: object) -> float:
@@ -1617,9 +1653,84 @@ def compute_leg_contribution_metrics(
     }
 
 
+def compute_event_context(
+    stock_x: str,
+    stock_y: str,
+    latest_date: pd.Timestamp,
+    event_calendar: pd.DataFrame,
+) -> Dict[str, object]:
+    """Return recent/upcoming public-event context for a pair."""
+    if event_calendar.empty:
+        return {
+            "has_event_window": False,
+            "event_symbols": "",
+            "event_reason": "",
+            "latest_event_date": "",
+            "event_days_from_signal": np.nan,
+        }
+
+    latest_ts = pd.Timestamp(latest_date)
+    pair_symbols = {str(stock_x).upper(), str(stock_y).upper()}
+    pair_events = event_calendar[event_calendar["symbol"].astype(str).str.upper().isin(pair_symbols)].copy()
+    if pair_events.empty:
+        return {
+            "has_event_window": False,
+            "event_symbols": "",
+            "event_reason": "",
+            "latest_event_date": "",
+            "event_days_from_signal": np.nan,
+        }
+
+    active_events: List[Dict[str, object]] = []
+    for _, event in pair_events.iterrows():
+        event_date = pd.Timestamp(event["event_date"])
+        days_from_event = business_days_between(event_date, latest_ts)
+        is_recent = 0 <= days_from_event <= EVENT_POST_COOLDOWN_BUSINESS_DAYS
+        days_to_event = business_days_between(latest_ts, event_date)
+        is_upcoming = 0 < days_to_event <= EVENT_PRE_BLOCK_BUSINESS_DAYS
+        if not is_recent and not is_upcoming:
+            continue
+
+        active_events.append(
+            {
+                "symbol": str(event["symbol"]).upper(),
+                "event_date": event_date.date().isoformat(),
+                "event_type": str(event.get("event_type", "event")),
+                "days_from_signal": days_from_event if is_recent else -days_to_event,
+                "window": "recent" if is_recent else "upcoming",
+            }
+        )
+
+    if not active_events:
+        return {
+            "has_event_window": False,
+            "event_symbols": "",
+            "event_reason": "",
+            "latest_event_date": "",
+            "event_days_from_signal": np.nan,
+        }
+
+    active_events = sorted(active_events, key=lambda item: (abs(int(item["days_from_signal"])), str(item["symbol"])))
+    symbols = "|".join(sorted({str(event["symbol"]) for event in active_events}))
+    dates = "|".join(sorted({str(event["event_date"]) for event in active_events}))
+    reasons = "|".join(
+        f"{event['symbol']}:{event['event_type']}:{event['window']}:{event['days_from_signal']}bd"
+        for event in active_events
+    )
+    nearest_days = int(active_events[0]["days_from_signal"])
+    return {
+        "has_event_window": True,
+        "event_symbols": symbols,
+        "event_reason": reasons,
+        "latest_event_date": dates,
+        "event_days_from_signal": nearest_days,
+    }
+
+
 def build_live_signal_row(
     pair_row: pd.Series,
     prices: pd.DataFrame,
+    event_calendar: Optional[pd.DataFrame] = None,
     z_window: int = Z_WINDOW,
     entry_z: float = ENTRY_Z,
     exit_z: float = EXIT_Z,
@@ -1658,6 +1769,12 @@ def build_live_signal_row(
     latest_zscore = safe_float(zscore.iloc[-1]) if not zscore.empty else np.nan
     current_position = safe_float(position.iloc[-1]) if not position.empty else 0.0
     current_action = latest_live_signal_action(current_position, latest_zscore, entry_z)
+    event_context = compute_event_context(
+        stock_x,
+        stock_y,
+        latest_date,
+        event_calendar if event_calendar is not None else pd.DataFrame(),
+    )
 
     return {
         "sector": str(pair_row["sector"]),
@@ -1685,6 +1802,11 @@ def build_live_signal_row(
         "recent_y_contribution": safe_float(leg_contribution["recent_y_contribution"]),
         "dominant_leg": str(leg_contribution["dominant_leg"]),
         "dominant_leg_share": safe_float(leg_contribution["dominant_leg_share"]),
+        "has_event_window": bool(event_context["has_event_window"]),
+        "event_symbols": str(event_context["event_symbols"]),
+        "event_reason": str(event_context["event_reason"]),
+        "latest_event_date": str(event_context["latest_event_date"]),
+        "event_days_from_signal": safe_float(event_context["event_days_from_signal"]),
         "recent_corr_mean": safe_float(live_stability["recent_corr_mean"]),
         "recent_corr_std": safe_float(live_stability["recent_corr_std"]),
         "recent_beta_std": safe_float(live_stability["recent_beta_std"]),
@@ -1694,14 +1816,19 @@ def build_live_signal_row(
     }
 
 
-def build_live_signals(ranked_df: pd.DataFrame, prices: pd.DataFrame, top_n: int) -> pd.DataFrame:
+def build_live_signals(
+    ranked_df: pd.DataFrame,
+    prices: pd.DataFrame,
+    top_n: int,
+    event_calendar: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """Build live-signal rows for the top ranked pairs."""
     if ranked_df.empty or prices.empty:
         return pd.DataFrame()
 
     rows: List[Dict[str, object]] = []
     for _, row in ranked_df.head(top_n).iterrows():
-        live_row = build_live_signal_row(row, prices)
+        live_row = build_live_signal_row(row, prices, event_calendar=event_calendar)
         if live_row is not None:
             rows.append(live_row)
 
@@ -1929,11 +2056,13 @@ def build_summary_report(ranked_df: pd.DataFrame, near_miss_df: pd.DataFrame, li
                     "YES" if bool(row.get("passes_leg_contribution", True)) else "NO",
                     f"{safe_float(row.get('dominant_leg_share')):.2f}",
                     str(row.get("leg_contribution_reason", "")),
+                    "YES" if bool(row.get("has_event_window", False)) else "NO",
+                    str(row.get("event_reason", "")),
                 ]
             )
         lines.extend(
             markdown_table(
-                ["Sector", "Pair", "Date", "Live Z", "Live Beta", "Live Half-Life", "Position", "Action", "Live Rec", "Stable", "Stability Reason", "Leg OK", "Dominant Share", "Leg Reason"],
+                ["Sector", "Pair", "Date", "Live Z", "Live Beta", "Live Half-Life", "Position", "Action", "Live Rec", "Stable", "Stability Reason", "Leg OK", "Dominant Share", "Leg Reason", "Event Window", "Event Reason"],
                 live_rows,
             )
         )
@@ -2026,8 +2155,14 @@ def main() -> None:
     ensure_project_directories()
 
     clear_plot_dir(PLOT_DIR)
+    event_calendar = load_event_calendar(EVENT_CALENDAR_CSV)
     ranked_pairs, diagnostics, window_metrics, downloaded_prices = analyze_universe(UNIVERSE)
-    live_signals = build_live_signals(ranked_pairs, downloaded_prices, LIVE_SIGNAL_TOP_N)
+    live_signals = build_live_signals(
+        ranked_pairs,
+        downloaded_prices,
+        LIVE_SIGNAL_TOP_N,
+        event_calendar=event_calendar,
+    )
 
     if ranked_pairs.empty:
         print("No qualifying pairs found.")

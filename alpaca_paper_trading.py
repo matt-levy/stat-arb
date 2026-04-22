@@ -358,6 +358,14 @@ def is_near_exit(row: pd.Series, config: AlpacaConfig) -> bool:
     return False
 
 
+def has_event_window(row: pd.Series) -> bool:
+    """Return whether a pair is in a manually curated public event window."""
+    raw_value = row.get("has_event_window", False)
+    if isinstance(raw_value, bool):
+        return raw_value
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "y"}
+
+
 def calculate_pair_sizing(row: pd.Series, deployable_capital: float, config: AlpacaConfig) -> Optional[Dict[str, object]]:
     """Convert one pair row into whole-share targets and reject poor hedge geometry."""
     action = str(row.get("current_action", "")).strip()
@@ -416,6 +424,7 @@ def calculate_pair_sizing(row: pd.Series, deployable_capital: float, config: Alp
         "notional_imbalance": notional_imbalance,
         "notional_imbalance_pct": imbalance_pct,
         "near_exit_no_add": is_near_exit(row, config),
+        "event_no_add": has_event_window(row),
     }
 
 
@@ -449,6 +458,8 @@ def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, c
                     "target_notional": x_sign * x_qty * price_x,
                     "notional_imbalance_pct": safe_float(sizing["notional_imbalance_pct"]),
                     "near_exit_no_add": bool(sizing["near_exit_no_add"]),
+                    "event_no_add": bool(sizing["event_no_add"]),
+                    "event_reason": str(row.get("event_reason", "")),
                 },
                 {
                     "pair": row["pair"],
@@ -458,6 +469,8 @@ def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, c
                     "target_notional": y_sign * y_qty * price_y,
                     "notional_imbalance_pct": safe_float(sizing["notional_imbalance_pct"]),
                     "near_exit_no_add": bool(sizing["near_exit_no_add"]),
+                    "event_no_add": bool(sizing["event_no_add"]),
+                    "event_reason": str(row.get("event_reason", "")),
                 },
             ]
         )
@@ -474,6 +487,8 @@ def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, c
             target_notional=("target_notional", "sum"),
             notional_imbalance_pct=("notional_imbalance_pct", "max"),
             near_exit_no_add=("near_exit_no_add", "max"),
+            event_no_add=("event_no_add", "max"),
+            event_reason=("event_reason", lambda values: " | ".join(sorted({str(value) for value in values if str(value)}))),
             source_pairs=("pair", lambda values: " | ".join(sorted(set(values)))),
         )
     )
@@ -531,6 +546,8 @@ def build_pair_trade_plan(ready_universe: pd.DataFrame, deployable_capital: floa
                 ),
                 "notional_imbalance_pct": safe_float(sizing["notional_imbalance_pct"]),
                 "near_exit_no_add": bool(sizing["near_exit_no_add"]),
+                "event_no_add": bool(sizing["event_no_add"]),
+                "event_reason": str(row.get("event_reason", "")),
             }
         )
 
@@ -568,6 +585,8 @@ def build_order_preview(
             "source_pairs": row["source_pairs"],
             "notional_imbalance_pct": safe_float(row.get("notional_imbalance_pct")),
             "near_exit_no_add": bool(row.get("near_exit_no_add", False)),
+            "event_no_add": bool(row.get("event_no_add", False)),
+            "event_reason": str(row.get("event_reason", "")),
         }
         for _, row in leg_targets.iterrows()
     }
@@ -585,6 +604,8 @@ def build_order_preview(
             continue
         if target_map.get(symbol, {}).get("near_exit_no_add", False) and abs(target_qty) > abs(current_qty):
             continue
+        if target_map.get(symbol, {}).get("event_no_add", False) and abs(target_qty) > abs(current_qty):
+            continue
 
         side = "buy" if delta_qty > 0 else "sell"
         preview_rows.append(
@@ -599,6 +620,8 @@ def build_order_preview(
                 "target_notional": safe_float(target_map.get(symbol, {}).get("target_notional")),
                 "notional_imbalance_pct": safe_float(target_map.get(symbol, {}).get("notional_imbalance_pct")),
                 "near_exit_no_add": bool(target_map.get(symbol, {}).get("near_exit_no_add", False)),
+                "event_no_add": bool(target_map.get(symbol, {}).get("event_no_add", False)),
+                "event_reason": str(target_map.get(symbol, {}).get("event_reason", "")),
                 "source_pairs": target_map.get(symbol, {}).get("source_pairs", ""),
             }
         )
@@ -904,6 +927,8 @@ def build_trade_log_rows(pair_trade_plan: pd.DataFrame, execution_df: pd.DataFra
         "net_notional",
         "notional_imbalance_pct",
         "near_exit_no_add",
+        "event_no_add",
+        "event_reason",
         "order_count",
         "alpaca_status",
         "order_ids",

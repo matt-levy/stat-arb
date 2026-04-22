@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from pair_checker import determine_operational_action
+from pair_checker import compute_event_context, determine_operational_action
 from paper_trading_ready import build_ready_pairs, normalize_capped_weights, weight_from_row
 from run_pipeline import main as run_pipeline_main
 
@@ -31,6 +31,24 @@ class ReadySignalTests(unittest.TestCase):
         )
 
         self.assertEqual(recommendation, "PAPER_TRADE_READY")
+
+    def test_event_context_detects_recent_public_event_window(self):
+        events = pd.DataFrame(
+            [
+                {
+                    "symbol": "C",
+                    "event_date": pd.Timestamp("2026-04-14"),
+                    "event_type": "earnings",
+                    "source": "https://example.com/public-earnings",
+                }
+            ]
+        )
+
+        context = compute_event_context("C", "GS", pd.Timestamp("2026-04-16"), events)
+
+        self.assertTrue(context["has_event_window"])
+        self.assertEqual(context["event_symbols"], "C")
+        self.assertIn("C:earnings:recent", context["event_reason"])
 
     def test_weight_from_row_rewards_stronger_research_inputs(self):
         weak_row = {
@@ -77,6 +95,11 @@ class ReadySignalTests(unittest.TestCase):
                     "recent_y_contribution": 0.01,
                     "dominant_leg": "X",
                     "dominant_leg_share": 0.5,
+                    "has_event_window": False,
+                    "event_symbols": "",
+                    "event_reason": "",
+                    "latest_event_date": "",
+                    "event_days_from_signal": "",
                     "latest_price_x": 130.0,
                     "latest_price_y": 900.0,
                 },
@@ -98,6 +121,11 @@ class ReadySignalTests(unittest.TestCase):
                     "recent_y_contribution": 0.01,
                     "dominant_leg": "X",
                     "dominant_leg_share": 0.5,
+                    "has_event_window": False,
+                    "event_symbols": "",
+                    "event_reason": "",
+                    "latest_event_date": "",
+                    "event_days_from_signal": "",
                     "latest_price_x": 300.0,
                     "latest_price_y": 900.0,
                 },
@@ -119,6 +147,11 @@ class ReadySignalTests(unittest.TestCase):
                     "recent_y_contribution": 0.01,
                     "dominant_leg": "X",
                     "dominant_leg_share": 0.5,
+                    "has_event_window": False,
+                    "event_symbols": "",
+                    "event_reason": "",
+                    "latest_event_date": "",
+                    "event_days_from_signal": "",
                     "latest_price_x": 450.0,
                     "latest_price_y": 265.0,
                 },
@@ -140,6 +173,11 @@ class ReadySignalTests(unittest.TestCase):
                     "recent_y_contribution": 0.01,
                     "dominant_leg": "X",
                     "dominant_leg_share": 0.5,
+                    "has_event_window": False,
+                    "event_symbols": "",
+                    "event_reason": "",
+                    "latest_event_date": "",
+                    "event_days_from_signal": "",
                     "latest_price_x": 100.0,
                     "latest_price_y": 150.0,
                 },

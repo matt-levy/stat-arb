@@ -40,6 +40,11 @@ READY_OUTPUT_COLUMNS = [
     "recent_y_contribution",
     "dominant_leg",
     "dominant_leg_share",
+    "has_event_window",
+    "event_symbols",
+    "event_reason",
+    "latest_event_date",
+    "event_days_from_signal",
     "score",
     "confidence_score",
     "confidence_rank",
@@ -166,6 +171,11 @@ def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) ->
         "recent_y_contribution": np.nan,
         "dominant_leg": "",
         "dominant_leg_share": np.nan,
+        "has_event_window": False,
+        "event_symbols": "",
+        "event_reason": "",
+        "latest_event_date": "",
+        "event_days_from_signal": np.nan,
     }.items():
         if column not in merged.columns:
             merged[column] = default
@@ -218,7 +228,7 @@ def print_ready_summary(ready_pairs: pd.DataFrame) -> None:
         ]
     ].copy()
 
-    for column in ["portfolio_weight", "live_zscore", "live_beta", "dominant_leg_share", "score", "confidence_score", "robustness_score"]:
+    for column in ["portfolio_weight", "live_zscore", "live_beta", "dominant_leg_share", "event_days_from_signal", "score", "confidence_score", "robustness_score"]:
         if column not in display_df.columns:
             continue
         display_df[column] = display_df[column].astype(float).round(4)

@@ -200,6 +200,8 @@ class AlpacaPaperTradingTests(unittest.TestCase):
                     "source_pairs": "C vs GS",
                     "notional_imbalance_pct": 0.02,
                     "near_exit_no_add": True,
+                    "event_no_add": False,
+                    "event_reason": "",
                 },
                 {
                     "symbol": "GS",
@@ -209,6 +211,8 @@ class AlpacaPaperTradingTests(unittest.TestCase):
                     "source_pairs": "C vs GS",
                     "notional_imbalance_pct": 0.02,
                     "near_exit_no_add": True,
+                    "event_no_add": False,
+                    "event_reason": "",
                 },
             ]
         )
@@ -232,6 +236,71 @@ class AlpacaPaperTradingTests(unittest.TestCase):
                     "source_pairs": "C vs GS",
                     "notional_imbalance_pct": 0.02,
                     "near_exit_no_add": True,
+                    "event_no_add": False,
+                    "event_reason": "",
+                }
+            ]
+        )
+
+        preview_df = build_order_preview(
+            leg_targets=leg_targets,
+            current_positions={"C": -9},
+            managed_symbols=["C"],
+        )
+
+        self.assertEqual(list(preview_df["symbol"]), ["C"])
+        self.assertEqual(list(preview_df["side"]), ["buy"])
+        self.assertEqual(list(preview_df["order_qty"]), [1])
+
+    def test_build_order_preview_does_not_increase_during_event_window(self):
+        leg_targets = pd.DataFrame(
+            [
+                {
+                    "symbol": "C",
+                    "target_qty": -9,
+                    "reference_price": 130.0,
+                    "target_notional": -1170.0,
+                    "source_pairs": "C vs GS",
+                    "notional_imbalance_pct": 0.02,
+                    "near_exit_no_add": False,
+                    "event_no_add": True,
+                    "event_reason": "C:earnings:recent:1bd",
+                },
+                {
+                    "symbol": "GS",
+                    "target_qty": 1,
+                    "reference_price": 930.0,
+                    "target_notional": 930.0,
+                    "source_pairs": "C vs GS",
+                    "notional_imbalance_pct": 0.02,
+                    "near_exit_no_add": False,
+                    "event_no_add": True,
+                    "event_reason": "C:earnings:recent:1bd",
+                },
+            ]
+        )
+
+        preview_df = build_order_preview(
+            leg_targets=leg_targets,
+            current_positions={"C": -8, "GS": 1},
+            managed_symbols=["C", "GS"],
+        )
+
+        self.assertTrue(preview_df.empty)
+
+    def test_build_order_preview_allows_event_window_exposure_reduction(self):
+        leg_targets = pd.DataFrame(
+            [
+                {
+                    "symbol": "C",
+                    "target_qty": -8,
+                    "reference_price": 130.0,
+                    "target_notional": -1040.0,
+                    "source_pairs": "C vs GS",
+                    "notional_imbalance_pct": 0.02,
+                    "near_exit_no_add": False,
+                    "event_no_add": True,
+                    "event_reason": "C:earnings:recent:1bd",
                 }
             ]
         )

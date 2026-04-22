@@ -3,5 +3,10 @@ __pycache__/
 .env
 .env.*
 *.csv
+!data/earnings_events.csv
 *.md
 pair_plots/
+data/
+logs/
+outputs/
+reports/
