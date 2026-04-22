@@ -26,6 +26,7 @@ POSITIONS_SNAPSHOT_LOG_OUTPUT = LOGS_DIR / "alpaca_positions_snapshots.csv"
 ORDER_FILL_LOG_OUTPUT = LOGS_DIR / "alpaca_order_fills.csv"
 PAIR_LIFECYCLE_LOG_OUTPUT = LOGS_DIR / "alpaca_pair_lifecycle_log.csv"
 PAIR_RISK_EVENTS_LOG_OUTPUT = LOGS_DIR / "alpaca_pair_risk_events.csv"
+PAIR_ATTRIBUTION_OUTPUT = OUTPUTS_DIR / "alpaca_pair_attribution.csv"
 
 DEFAULT_BASE_URL = "https://paper-api.alpaca.markets"
 DEFAULT_DRY_RUN = True
@@ -34,6 +35,8 @@ DEFAULT_BUYING_POWER_USAGE_FRACTION = 0.50
 DEFAULT_MIN_LEG_NOTIONAL = 100.0
 DEFAULT_MAX_SIGNAL_STALENESS_DAYS = 3
 DEFAULT_PAIR_STOP_LOSS_FRACTION = 0.0
+DEFAULT_MAX_PAIR_NOTIONAL_IMBALANCE_PCT = 0.10
+DEFAULT_NEAR_EXIT_NO_ADD_Z = 0.75
 REQUEST_TIMEOUT_SECONDS = 20
 ACTIVE_EXECUTION_STATUSES = {
     "accepted",
@@ -62,6 +65,8 @@ class AlpacaConfig:
     flatten_on_no_targets: bool
     pair_stop_loss_fraction: float
     pair_denylist: List[str]
+    max_pair_notional_imbalance_pct: float
+    near_exit_no_add_z: float
 
 
 def load_env_file(path: Path) -> None:
@@ -157,6 +162,11 @@ def load_config() -> AlpacaConfig:
         flatten_on_no_targets=parse_bool_env("ALPACA_FLATTEN_ON_NO_TARGETS", False),
         pair_stop_loss_fraction=max(parse_float_env("ALPACA_PAIR_STOP_LOSS_FRACTION", DEFAULT_PAIR_STOP_LOSS_FRACTION), 0.0),
         pair_denylist=parse_list_env("ALPACA_PAIR_DENYLIST"),
+        max_pair_notional_imbalance_pct=max(
+            parse_float_env("ALPACA_MAX_PAIR_NOTIONAL_IMBALANCE_PCT", DEFAULT_MAX_PAIR_NOTIONAL_IMBALANCE_PCT),
+            0.0,
+        ),
+        near_exit_no_add_z=max(parse_float_env("ALPACA_NEAR_EXIT_NO_ADD_Z", DEFAULT_NEAR_EXIT_NO_ADD_Z), 0.0),
     )
 
 
@@ -335,6 +345,80 @@ def determine_deployable_capital(account: Dict[str, object], config: AlpacaConfi
     return min(equity_budget, buying_power_budget)
 
 
+def is_near_exit(row: pd.Series, config: AlpacaConfig) -> bool:
+    """Return whether an active spread is close enough to exit that exposure should not increase."""
+    action = str(row.get("current_action", "")).strip()
+    zscore = safe_float(row.get("live_zscore"))
+    if not np.isfinite(zscore) or config.near_exit_no_add_z <= 0:
+        return False
+    if action == "SHORT_SPREAD":
+        return zscore <= config.near_exit_no_add_z
+    if action == "LONG_SPREAD":
+        return zscore >= -config.near_exit_no_add_z
+    return False
+
+
+def calculate_pair_sizing(row: pd.Series, deployable_capital: float, config: AlpacaConfig) -> Optional[Dict[str, object]]:
+    """Convert one pair row into whole-share targets and reject poor hedge geometry."""
+    action = str(row.get("current_action", "")).strip()
+    if action not in {"LONG_SPREAD", "SHORT_SPREAD"}:
+        return None
+
+    beta = abs(safe_float(row.get("live_beta")))
+    price_x = safe_float(row.get("latest_price_x"))
+    price_y = safe_float(row.get("latest_price_y"))
+    weight = max(safe_float(row.get("portfolio_weight")), 0.0)
+
+    if not np.isfinite(beta) or not np.isfinite(price_x) or not np.isfinite(price_y):
+        return None
+    if beta <= 0 or price_x <= 0 or price_y <= 0 or weight <= 0:
+        return None
+
+    gross_pair_notional = deployable_capital * weight
+    x_weight = 1.0 / (1.0 + beta)
+    y_weight = beta / (1.0 + beta)
+
+    intended_x_notional = gross_pair_notional * x_weight
+    intended_y_notional = gross_pair_notional * y_weight
+
+    if intended_x_notional < config.min_leg_notional or intended_y_notional < config.min_leg_notional:
+        return None
+
+    x_qty = int(np.floor(intended_x_notional / price_x))
+    y_qty = int(np.floor(intended_y_notional / price_y))
+    if x_qty <= 0 or y_qty <= 0:
+        return None
+
+    actual_x_notional = x_qty * price_x
+    actual_y_notional = y_qty * price_y
+    actual_gross_notional = actual_x_notional + actual_y_notional
+    notional_imbalance = abs(actual_x_notional - actual_y_notional)
+    imbalance_pct = notional_imbalance / actual_gross_notional if actual_gross_notional > 0 else float("inf")
+    hedge_quality_pass = (
+        np.isfinite(imbalance_pct)
+        and imbalance_pct <= config.max_pair_notional_imbalance_pct
+    )
+    if not hedge_quality_pass:
+        return None
+
+    return {
+        "beta": beta,
+        "price_x": price_x,
+        "price_y": price_y,
+        "weight": weight,
+        "x_qty": x_qty,
+        "y_qty": y_qty,
+        "intended_x_notional": intended_x_notional,
+        "intended_y_notional": intended_y_notional,
+        "actual_x_notional": actual_x_notional,
+        "actual_y_notional": actual_y_notional,
+        "actual_gross_notional": actual_gross_notional,
+        "notional_imbalance": notional_imbalance,
+        "notional_imbalance_pct": imbalance_pct,
+        "near_exit_no_add": is_near_exit(row, config),
+    }
+
+
 def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, config: AlpacaConfig) -> pd.DataFrame:
     """Convert pair allocations into per-symbol target share counts."""
     if ready_universe.empty:
@@ -344,36 +428,16 @@ def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, c
 
     for _, row in ready_universe.iterrows():
         action = str(row.get("current_action", "")).strip()
-        if action not in {"LONG_SPREAD", "SHORT_SPREAD"}:
-            continue
-
-        beta = abs(safe_float(row.get("live_beta")))
-        price_x = safe_float(row.get("latest_price_x"))
-        price_y = safe_float(row.get("latest_price_y"))
-        weight = max(safe_float(row.get("portfolio_weight")), 0.0)
-
-        if not np.isfinite(beta) or not np.isfinite(price_x) or not np.isfinite(price_y):
-            continue
-        if beta <= 0 or price_x <= 0 or price_y <= 0 or weight <= 0:
-            continue
-
-        gross_pair_notional = deployable_capital * weight
-        x_weight = 1.0 / (1.0 + beta)
-        y_weight = beta / (1.0 + beta)
-
-        x_notional = gross_pair_notional * x_weight
-        y_notional = gross_pair_notional * y_weight
-
-        if x_notional < config.min_leg_notional or y_notional < config.min_leg_notional:
-            continue
-
-        x_qty = int(np.floor(x_notional / price_x))
-        y_qty = int(np.floor(y_notional / price_y))
-        if x_qty <= 0 or y_qty <= 0:
+        sizing = calculate_pair_sizing(row, deployable_capital, config)
+        if sizing is None:
             continue
 
         x_sign = 1 if action == "LONG_SPREAD" else -1
         y_sign = -1 if action == "LONG_SPREAD" else 1
+        x_qty = int(sizing["x_qty"])
+        y_qty = int(sizing["y_qty"])
+        price_x = safe_float(sizing["price_x"])
+        price_y = safe_float(sizing["price_y"])
 
         leg_rows.extend(
             [
@@ -383,6 +447,8 @@ def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, c
                     "target_qty": x_sign * x_qty,
                     "reference_price": price_x,
                     "target_notional": x_sign * x_qty * price_x,
+                    "notional_imbalance_pct": safe_float(sizing["notional_imbalance_pct"]),
+                    "near_exit_no_add": bool(sizing["near_exit_no_add"]),
                 },
                 {
                     "pair": row["pair"],
@@ -390,6 +456,8 @@ def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, c
                     "target_qty": y_sign * y_qty,
                     "reference_price": price_y,
                     "target_notional": y_sign * y_qty * price_y,
+                    "notional_imbalance_pct": safe_float(sizing["notional_imbalance_pct"]),
+                    "near_exit_no_add": bool(sizing["near_exit_no_add"]),
                 },
             ]
         )
@@ -404,6 +472,8 @@ def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, c
             target_qty=("target_qty", "sum"),
             reference_price=("reference_price", "last"),
             target_notional=("target_notional", "sum"),
+            notional_imbalance_pct=("notional_imbalance_pct", "max"),
+            near_exit_no_add=("near_exit_no_add", "max"),
             source_pairs=("pair", lambda values: " | ".join(sorted(set(values)))),
         )
     )
@@ -419,33 +489,11 @@ def build_pair_trade_plan(ready_universe: pd.DataFrame, deployable_capital: floa
 
     for _, row in ready_universe.iterrows():
         action = str(row.get("current_action", "")).strip()
-        if action not in {"LONG_SPREAD", "SHORT_SPREAD"}:
+        sizing = calculate_pair_sizing(row, deployable_capital, config)
+        if sizing is None:
             continue
-
-        beta = abs(safe_float(row.get("live_beta")))
-        price_x = safe_float(row.get("latest_price_x"))
-        price_y = safe_float(row.get("latest_price_y"))
-        weight = max(safe_float(row.get("portfolio_weight")), 0.0)
-
-        if not np.isfinite(beta) or not np.isfinite(price_x) or not np.isfinite(price_y):
-            continue
-        if beta <= 0 or price_x <= 0 or price_y <= 0 or weight <= 0:
-            continue
-
-        gross_pair_notional = deployable_capital * weight
-        x_weight = 1.0 / (1.0 + beta)
-        y_weight = beta / (1.0 + beta)
-
-        x_notional = gross_pair_notional * x_weight
-        y_notional = gross_pair_notional * y_weight
-
-        if x_notional < config.min_leg_notional or y_notional < config.min_leg_notional:
-            continue
-
-        x_qty = int(np.floor(x_notional / price_x))
-        y_qty = int(np.floor(y_notional / price_y))
-        if x_qty <= 0 or y_qty <= 0:
-            continue
+        x_qty = int(sizing["x_qty"])
+        y_qty = int(sizing["y_qty"])
 
         if action == "LONG_SPREAD":
             long_symbol = str(row["stock_x"]).upper()
@@ -474,6 +522,15 @@ def build_pair_trade_plan(ready_universe: pd.DataFrame, deployable_capital: floa
                 "live_beta": safe_float(row["live_beta"]),
                 "live_half_life": safe_float(row["live_half_life"]),
                 "exit_rule": exit_rule,
+                "target_long_notional": y_qty * safe_float(sizing["price_y"]) if action == "SHORT_SPREAD" else x_qty * safe_float(sizing["price_x"]),
+                "target_short_notional": x_qty * safe_float(sizing["price_x"]) if action == "SHORT_SPREAD" else y_qty * safe_float(sizing["price_y"]),
+                "net_notional": (
+                    y_qty * safe_float(sizing["price_y"]) - x_qty * safe_float(sizing["price_x"])
+                    if action == "SHORT_SPREAD"
+                    else x_qty * safe_float(sizing["price_x"]) - y_qty * safe_float(sizing["price_y"])
+                ),
+                "notional_imbalance_pct": safe_float(sizing["notional_imbalance_pct"]),
+                "near_exit_no_add": bool(sizing["near_exit_no_add"]),
             }
         )
 
@@ -509,6 +566,8 @@ def build_order_preview(
             "reference_price": safe_float(row["reference_price"]),
             "target_notional": safe_float(row["target_notional"]),
             "source_pairs": row["source_pairs"],
+            "notional_imbalance_pct": safe_float(row.get("notional_imbalance_pct")),
+            "near_exit_no_add": bool(row.get("near_exit_no_add", False)),
         }
         for _, row in leg_targets.iterrows()
     }
@@ -524,6 +583,8 @@ def build_order_preview(
         delta_qty = target_qty - current_qty
         if delta_qty == 0:
             continue
+        if target_map.get(symbol, {}).get("near_exit_no_add", False) and abs(target_qty) > abs(current_qty):
+            continue
 
         side = "buy" if delta_qty > 0 else "sell"
         preview_rows.append(
@@ -536,6 +597,8 @@ def build_order_preview(
                 "delta_qty": delta_qty,
                 "reference_price": safe_float(target_map.get(symbol, {}).get("reference_price")),
                 "target_notional": safe_float(target_map.get(symbol, {}).get("target_notional")),
+                "notional_imbalance_pct": safe_float(target_map.get(symbol, {}).get("notional_imbalance_pct")),
+                "near_exit_no_add": bool(target_map.get(symbol, {}).get("near_exit_no_add", False)),
                 "source_pairs": target_map.get(symbol, {}).get("source_pairs", ""),
             }
         )
@@ -550,7 +613,9 @@ def print_order_preview(preview_df: pd.DataFrame) -> None:
         return
 
     display_df = preview_df.copy()
-    for column in ["reference_price", "target_notional"]:
+    for column in ["reference_price", "target_notional", "notional_imbalance_pct"]:
+        if column not in display_df.columns:
+            continue
         display_df[column] = display_df[column].astype(float).round(2)
 
     print("\nAlpaca Paper Trade Preview")
@@ -834,11 +899,17 @@ def build_trade_log_rows(pair_trade_plan: pd.DataFrame, execution_df: pd.DataFra
         "live_beta",
         "live_half_life",
         "exit_rule",
+        "target_long_notional",
+        "target_short_notional",
+        "net_notional",
+        "notional_imbalance_pct",
+        "near_exit_no_add",
         "order_count",
         "alpaca_status",
         "order_ids",
     ]
-    return trade_log[ordered_columns]
+    available = [column for column in ordered_columns if column in trade_log.columns]
+    return trade_log[available]
 
 
 def build_account_snapshot_rows(account: Dict[str, object], deployable_capital: float) -> pd.DataFrame:
@@ -1003,6 +1074,204 @@ def build_order_fill_rows(execution_df: pd.DataFrame) -> pd.DataFrame:
     return execution_df[available].copy()
 
 
+def reconcile_order_fill_log(client: AlpacaClient, path: Path) -> pd.DataFrame:
+    """Refresh known Alpaca order statuses so local fill logs do not stay stale."""
+    fill_log = load_csv(path)
+    if fill_log.empty or "alpaca_order_id" not in fill_log.columns:
+        return fill_log
+
+    reconciled = fill_log.copy()
+    for column in ["filled_at", "expired_at", "canceled_at"]:
+        if column not in reconciled.columns:
+            reconciled[column] = ""
+
+    for index, row in reconciled.iterrows():
+        order_id = str(row.get("alpaca_order_id", "")).strip()
+        if not order_id or order_id.lower() == "nan":
+            continue
+
+        try:
+            order = client.get_order(order_id)
+        except requests.HTTPError as exc:
+            reconciled.at[index, "error"] = str(exc)
+            continue
+
+        reconciled.at[index, "alpaca_status"] = str(order.get("status", ""))
+        reconciled.at[index, "filled_qty"] = safe_float(order.get("filled_qty"))
+        reconciled.at[index, "filled_avg_price"] = safe_float(order.get("filled_avg_price"))
+        reconciled.at[index, "created_at"] = order.get("created_at", "")
+        reconciled.at[index, "updated_at"] = order.get("updated_at", "")
+        reconciled.at[index, "filled_at"] = order.get("filled_at", "")
+        reconciled.at[index, "expired_at"] = order.get("expired_at", "")
+        reconciled.at[index, "canceled_at"] = order.get("canceled_at", "")
+
+    reconciled.to_csv(path, index=False)
+    return reconciled
+
+
+def build_pair_attribution_rows(pair_trade_plan: pd.DataFrame, positions: List[Dict[str, object]]) -> pd.DataFrame:
+    """Build current share-level attribution for active pair targets."""
+    if pair_trade_plan.empty:
+        return pd.DataFrame()
+
+    position_details = build_position_details_map(positions)
+    captured_at = datetime.now().isoformat(timespec="seconds")
+    rows: List[Dict[str, object]] = []
+
+    for _, row in pair_trade_plan.iterrows():
+        long_symbol = str(row.get("long_symbol", "")).upper()
+        short_symbol = str(row.get("short_symbol", "")).upper()
+        long_qty = int(safe_float(row.get("long_qty", 0)))
+        short_qty = int(safe_float(row.get("short_qty", 0)))
+        long_position = position_details.get(long_symbol, {})
+        short_position = position_details.get(short_symbol, {})
+
+        current_long_qty = max(int(long_position.get("qty", 0)), 0)
+        current_short_qty = max(-int(short_position.get("qty", 0)), 0)
+        matched_long_qty = min(current_long_qty, long_qty)
+        matched_short_qty = min(current_short_qty, short_qty)
+
+        long_entry = safe_float(long_position.get("avg_entry_price"))
+        long_price = safe_float(long_position.get("current_price"))
+        short_entry = safe_float(short_position.get("avg_entry_price"))
+        short_price = safe_float(short_position.get("current_price"))
+
+        long_pnl = (
+            (long_price - long_entry) * matched_long_qty
+            if matched_long_qty > 0 and np.isfinite(long_entry) and np.isfinite(long_price)
+            else float("nan")
+        )
+        short_pnl = (
+            (short_entry - short_price) * matched_short_qty
+            if matched_short_qty > 0 and np.isfinite(short_entry) and np.isfinite(short_price)
+            else float("nan")
+        )
+        actual_long_notional = long_price * matched_long_qty if np.isfinite(long_price) else float("nan")
+        actual_short_notional = short_price * matched_short_qty if np.isfinite(short_price) else float("nan")
+        actual_gross_notional = actual_long_notional + actual_short_notional
+        actual_net_notional = actual_long_notional - actual_short_notional
+        actual_imbalance_pct = (
+            abs(actual_net_notional) / actual_gross_notional
+            if np.isfinite(actual_gross_notional) and actual_gross_notional > 0
+            else float("nan")
+        )
+
+        rows.append(
+            {
+                "captured_at": captured_at,
+                "signal_date": row.get("signal_date", ""),
+                "pair": row.get("pair", ""),
+                "action": row.get("action", ""),
+                "live_zscore": safe_float(row.get("live_zscore")),
+                "long_symbol": long_symbol,
+                "long_target_qty": long_qty,
+                "long_current_qty": current_long_qty,
+                "long_avg_entry_price": long_entry,
+                "long_current_price": long_price,
+                "long_unrealized_pl": long_pnl,
+                "short_symbol": short_symbol,
+                "short_target_qty": short_qty,
+                "short_current_qty": current_short_qty,
+                "short_avg_entry_price": short_entry,
+                "short_current_price": short_price,
+                "short_unrealized_pl": short_pnl,
+                "pair_unrealized_pl": np.nansum([long_pnl, short_pnl]),
+                "actual_long_notional": actual_long_notional,
+                "actual_short_notional": actual_short_notional,
+                "actual_net_notional": actual_net_notional,
+                "actual_imbalance_pct": actual_imbalance_pct,
+                "target_long_notional": safe_float(row.get("target_long_notional")),
+                "target_short_notional": safe_float(row.get("target_short_notional")),
+                "target_net_notional": safe_float(row.get("net_notional")),
+                "target_imbalance_pct": safe_float(row.get("notional_imbalance_pct")),
+                "near_exit_no_add": bool(row.get("near_exit_no_add", False)),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_live_pair_attribution_rows(live_universe: pd.DataFrame, positions: List[Dict[str, object]]) -> pd.DataFrame:
+    """Build attribution for currently held pairs, even when they are not executable today."""
+    if live_universe.empty:
+        return pd.DataFrame()
+
+    position_details = build_position_details_map(positions)
+    captured_at = datetime.now().isoformat(timespec="seconds")
+    rows: List[Dict[str, object]] = []
+
+    for _, row in live_universe.iterrows():
+        action = str(row.get("current_action", "")).strip()
+        if action == "LONG_SPREAD":
+            long_symbol = str(row.get("stock_x", "")).upper()
+            short_symbol = str(row.get("stock_y", "")).upper()
+        elif action == "SHORT_SPREAD":
+            long_symbol = str(row.get("stock_y", "")).upper()
+            short_symbol = str(row.get("stock_x", "")).upper()
+        else:
+            continue
+
+        long_position = position_details.get(long_symbol, {})
+        short_position = position_details.get(short_symbol, {})
+        long_qty = max(int(long_position.get("qty", 0)), 0)
+        short_qty = max(-int(short_position.get("qty", 0)), 0)
+        if long_qty <= 0 or short_qty <= 0:
+            continue
+
+        long_entry = safe_float(long_position.get("avg_entry_price"))
+        long_price = safe_float(long_position.get("current_price"))
+        short_entry = safe_float(short_position.get("avg_entry_price"))
+        short_price = safe_float(short_position.get("current_price"))
+        long_pnl = (
+            (long_price - long_entry) * long_qty
+            if long_qty > 0 and np.isfinite(long_entry) and np.isfinite(long_price)
+            else float("nan")
+        )
+        short_pnl = (
+            (short_entry - short_price) * short_qty
+            if short_qty > 0 and np.isfinite(short_entry) and np.isfinite(short_price)
+            else float("nan")
+        )
+        actual_long_notional = long_price * long_qty if np.isfinite(long_price) else float("nan")
+        actual_short_notional = short_price * short_qty if np.isfinite(short_price) else float("nan")
+        actual_gross_notional = actual_long_notional + actual_short_notional
+        actual_net_notional = actual_long_notional - actual_short_notional
+        actual_imbalance_pct = (
+            abs(actual_net_notional) / actual_gross_notional
+            if np.isfinite(actual_gross_notional) and actual_gross_notional > 0
+            else float("nan")
+        )
+
+        rows.append(
+            {
+                "captured_at": captured_at,
+                "latest_date": row.get("latest_date", ""),
+                "pair": row.get("pair", ""),
+                "action": action,
+                "live_recommendation": row.get("live_recommendation", ""),
+                "live_zscore": safe_float(row.get("live_zscore")),
+                "live_beta": safe_float(row.get("live_beta")),
+                "long_symbol": long_symbol,
+                "long_current_qty": long_qty,
+                "long_avg_entry_price": long_entry,
+                "long_current_price": long_price,
+                "long_unrealized_pl": long_pnl,
+                "short_symbol": short_symbol,
+                "short_current_qty": short_qty,
+                "short_avg_entry_price": short_entry,
+                "short_current_price": short_price,
+                "short_unrealized_pl": short_pnl,
+                "pair_unrealized_pl": np.nansum([long_pnl, short_pnl]),
+                "actual_long_notional": actual_long_notional,
+                "actual_short_notional": actual_short_notional,
+                "actual_net_notional": actual_net_notional,
+                "actual_imbalance_pct": actual_imbalance_pct,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
 def append_csv_rows(path: Path, rows: pd.DataFrame) -> None:
     """Append rows to a CSV log, creating it if needed."""
     if rows.empty:
@@ -1053,6 +1322,9 @@ def main() -> None:
     client = AlpacaClient(config)
     account = client.get_account()
     positions = client.get_positions()
+    reconciled_fills = reconcile_order_fill_log(client, ORDER_FILL_LOG_OUTPUT)
+    if not reconciled_fills.empty:
+        print(f"Reconciled {len(reconciled_fills)} local order fill row(s) with Alpaca.")
 
     account_equity = safe_float(account.get("equity"))
     account_buying_power = safe_float(account.get("buying_power"))
@@ -1082,10 +1354,12 @@ def main() -> None:
     pair_lifecycle_df = build_pair_lifecycle_rows(live_universe, pair_trade_plan)
     account_snapshot_df = build_account_snapshot_rows(account, deployable_capital)
     positions_snapshot_df = build_positions_snapshot_rows(positions)
+    attribution_df = build_live_pair_attribution_rows(live_universe, positions)
 
     append_csv_rows(ACCOUNT_SNAPSHOT_LOG_OUTPUT, account_snapshot_df)
     append_csv_rows(POSITIONS_SNAPSHOT_LOG_OUTPUT, positions_snapshot_df)
     append_csv_rows(PAIR_LIFECYCLE_LOG_OUTPUT, pair_lifecycle_df)
+    attribution_df.to_csv(PAIR_ATTRIBUTION_OUTPUT, index=False)
 
     all_managed_symbols = sorted(extract_pair_symbols(live_universe))
     flatten_symbols = get_flatten_symbols_from_live_universe(live_universe, blocked_pairs)
@@ -1106,6 +1380,7 @@ def main() -> None:
         print(f"Account buying power: ${account_buying_power:,.2f}")
     print(f"Deployable capital: ${deployable_capital:,.2f}")
     print(f"Preview saved to: {ORDER_PREVIEW_OUTPUT.resolve()}")
+    print(f"Pair attribution saved to: {PAIR_ATTRIBUTION_OUTPUT.resolve()}")
     if flatten_symbols:
         print(f"Symbols marked for flatten-if-held: {', '.join(sorted(flatten_symbols))}")
     if blocked_pairs:

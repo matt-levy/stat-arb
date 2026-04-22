@@ -7,9 +7,11 @@ from alpaca_paper_trading import (
     AlpacaClient,
     AlpacaConfig,
     build_client_order_id,
+    build_leg_targets,
     build_order_preview,
     build_pair_lifecycle_rows,
     build_pair_risk_rows,
+    build_live_pair_attribution_rows,
     build_trade_log_rows,
     cancel_conflicting_open_orders,
     extract_pair_symbols,
@@ -33,6 +35,8 @@ def make_config() -> AlpacaConfig:
         flatten_on_no_targets=False,
         pair_stop_loss_fraction=0.01,
         pair_denylist=[],
+        max_pair_notional_imbalance_pct=0.10,
+        near_exit_no_add_z=0.75,
     )
 
 
@@ -163,6 +167,111 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         self.assertEqual(list(preview["symbol"]), ["C", "GS"])
         self.assertEqual(list(preview["side"]), ["buy", "sell"])
         self.assertEqual(list(preview["order_qty"]), [22, 1])
+
+    def test_build_leg_targets_rejects_post_rounding_notional_imbalance(self):
+        ready_universe = pd.DataFrame(
+            [
+                {
+                    "pair": "C vs GS",
+                    "stock_x": "C",
+                    "stock_y": "GS",
+                    "current_action": "SHORT_SPREAD",
+                    "portfolio_weight": 0.5,
+                    "live_beta": 1.07,
+                    "live_zscore": 1.2,
+                    "latest_price_x": 129.73,
+                    "latest_price_y": 934.84,
+                }
+            ]
+        )
+
+        leg_targets = build_leg_targets(ready_universe, deployable_capital=4960.0, config=make_config())
+
+        self.assertTrue(leg_targets.empty)
+
+    def test_build_order_preview_does_not_increase_near_exit_exposure(self):
+        leg_targets = pd.DataFrame(
+            [
+                {
+                    "symbol": "C",
+                    "target_qty": -9,
+                    "reference_price": 130.0,
+                    "target_notional": -1170.0,
+                    "source_pairs": "C vs GS",
+                    "notional_imbalance_pct": 0.02,
+                    "near_exit_no_add": True,
+                },
+                {
+                    "symbol": "GS",
+                    "target_qty": 1,
+                    "reference_price": 930.0,
+                    "target_notional": 930.0,
+                    "source_pairs": "C vs GS",
+                    "notional_imbalance_pct": 0.02,
+                    "near_exit_no_add": True,
+                },
+            ]
+        )
+
+        preview_df = build_order_preview(
+            leg_targets=leg_targets,
+            current_positions={"C": -8, "GS": 1},
+            managed_symbols=["C", "GS"],
+        )
+
+        self.assertTrue(preview_df.empty)
+
+    def test_build_order_preview_allows_near_exit_exposure_reduction(self):
+        leg_targets = pd.DataFrame(
+            [
+                {
+                    "symbol": "C",
+                    "target_qty": -8,
+                    "reference_price": 130.0,
+                    "target_notional": -1040.0,
+                    "source_pairs": "C vs GS",
+                    "notional_imbalance_pct": 0.02,
+                    "near_exit_no_add": True,
+                }
+            ]
+        )
+
+        preview_df = build_order_preview(
+            leg_targets=leg_targets,
+            current_positions={"C": -9},
+            managed_symbols=["C"],
+        )
+
+        self.assertEqual(list(preview_df["symbol"]), ["C"])
+        self.assertEqual(list(preview_df["side"]), ["buy"])
+        self.assertEqual(list(preview_df["order_qty"]), [1])
+
+    def test_build_live_pair_attribution_rows_reports_leg_pnl_and_imbalance(self):
+        live_universe = pd.DataFrame(
+            [
+                {
+                    "latest_date": "2026-04-22",
+                    "pair": "C vs GS",
+                    "stock_x": "C",
+                    "stock_y": "GS",
+                    "current_action": "SHORT_SPREAD",
+                    "live_recommendation": "PAPER_TRADE_READY",
+                    "live_zscore": 0.03,
+                    "live_beta": 1.07,
+                }
+            ]
+        )
+        positions = [
+            {"symbol": "C", "side": "short", "qty": "9", "avg_entry_price": "124.88", "current_price": "129.50"},
+            {"symbol": "GS", "side": "long", "qty": "1", "avg_entry_price": "902.38", "current_price": "934.84"},
+        ]
+
+        attribution = build_live_pair_attribution_rows(live_universe, positions)
+
+        self.assertEqual(list(attribution["pair"]), ["C vs GS"])
+        self.assertAlmostEqual(float(attribution.loc[0, "long_unrealized_pl"]), 32.46, places=2)
+        self.assertAlmostEqual(float(attribution.loc[0, "short_unrealized_pl"]), -41.58, places=2)
+        self.assertGreater(float(attribution.loc[0, "actual_imbalance_pct"]), 0.0)
 
     def test_build_trade_log_rows_expands_shared_symbol_orders_back_to_each_pair(self):
         pair_trade_plan = pd.DataFrame(

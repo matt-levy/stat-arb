@@ -20,6 +20,18 @@ class ReadySignalTests(unittest.TestCase):
 
         self.assertEqual(recommendation, "HOLD_ONLY")
 
+    def test_leg_contribution_failure_is_diagnostic_only(self):
+        recommendation = determine_operational_action(
+            research_verdict="STRONG_CANDIDATE",
+            confidence_score=9.0,
+            robustness_score=8.0,
+            live_action="SHORT_SPREAD",
+            passes_live_stability=True,
+            passes_leg_contribution=False,
+        )
+
+        self.assertEqual(recommendation, "PAPER_TRADE_READY")
+
     def test_weight_from_row_rewards_stronger_research_inputs(self):
         weak_row = {
             "score": 1.0,
@@ -59,6 +71,12 @@ class ReadySignalTests(unittest.TestCase):
                     "live_half_life": 10.0,
                     "passes_live_stability": True,
                     "live_stability_reason": "",
+                    "passes_leg_contribution": True,
+                    "leg_contribution_reason": "",
+                    "recent_x_contribution": 0.01,
+                    "recent_y_contribution": 0.01,
+                    "dominant_leg": "X",
+                    "dominant_leg_share": 0.5,
                     "latest_price_x": 130.0,
                     "latest_price_y": 900.0,
                 },
@@ -74,6 +92,12 @@ class ReadySignalTests(unittest.TestCase):
                     "live_half_life": 14.0,
                     "passes_live_stability": True,
                     "live_stability_reason": "",
+                    "passes_leg_contribution": True,
+                    "leg_contribution_reason": "",
+                    "recent_x_contribution": 0.01,
+                    "recent_y_contribution": 0.01,
+                    "dominant_leg": "X",
+                    "dominant_leg_share": 0.5,
                     "latest_price_x": 300.0,
                     "latest_price_y": 900.0,
                 },
@@ -89,6 +113,12 @@ class ReadySignalTests(unittest.TestCase):
                     "live_half_life": 7.0,
                     "passes_live_stability": True,
                     "live_stability_reason": "",
+                    "passes_leg_contribution": True,
+                    "leg_contribution_reason": "",
+                    "recent_x_contribution": 0.01,
+                    "recent_y_contribution": 0.01,
+                    "dominant_leg": "X",
+                    "dominant_leg_share": 0.5,
                     "latest_price_x": 450.0,
                     "latest_price_y": 265.0,
                 },
@@ -104,6 +134,12 @@ class ReadySignalTests(unittest.TestCase):
                     "live_half_life": 9.0,
                     "passes_live_stability": True,
                     "live_stability_reason": "",
+                    "passes_leg_contribution": True,
+                    "leg_contribution_reason": "",
+                    "recent_x_contribution": 0.01,
+                    "recent_y_contribution": 0.01,
+                    "dominant_leg": "X",
+                    "dominant_leg_share": 0.5,
                     "latest_price_x": 100.0,
                     "latest_price_y": 150.0,
                 },

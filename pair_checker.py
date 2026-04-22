@@ -78,6 +78,10 @@ LIVE_MIN_RECENT_CORR_MEAN = 0.55
 LIVE_MAX_RECENT_CORR_STD = 0.20
 LIVE_MAX_RECENT_BETA_STD = 0.20
 LIVE_MAX_RECENT_SPREAD_VOL_RATIO = 1.75
+LIVE_LEG_CONTRIBUTION_WINDOW = 20
+LIVE_MAX_DOMINANT_LEG_SHARE = 0.80
+LIVE_HARD_MAX_DOMINANT_LEG_SHARE = 0.90
+LIVE_STRONG_CORR_OVERRIDE = 0.85
 
 SCORE_SHARPE_WEIGHT = 4.0
 SCORE_RETURN_WEIGHT = 1.5
@@ -1434,8 +1438,13 @@ def determine_operational_action(
     robustness_score: float,
     live_action: str,
     passes_live_stability: bool,
+    passes_leg_contribution: bool = True,
 ) -> str:
-    """Convert research quality and current live context into an operational label."""
+    """Convert research quality and current live context into an operational label.
+
+    Leg-contribution metrics are diagnostic only. They are accepted here so callers can pass
+    the full live context without changing recommendation behavior.
+    """
     actionable_signal = live_action in {"LONG_SPREAD", "SHORT_SPREAD"}
     watch_signal = live_action in {"WATCH_LONG", "WATCH_SHORT", "FLAT"}
     research_ready = (
@@ -1554,6 +1563,60 @@ def compute_live_stability_metrics(
     }
 
 
+def compute_leg_contribution_metrics(
+    log_x: pd.Series,
+    log_y: pd.Series,
+    beta: float,
+    corr_mean: float,
+    window: int = LIVE_LEG_CONTRIBUTION_WINDOW,
+) -> Dict[str, object]:
+    """Measure whether recent spread movement is dominated by one leg."""
+    if pd.isna(beta) or len(log_x.dropna()) < window + 1 or len(log_y.dropna()) < window + 1:
+        return {
+            "recent_x_contribution": np.nan,
+            "recent_y_contribution": np.nan,
+            "dominant_leg": "",
+            "dominant_leg_share": np.nan,
+            "passes_leg_contribution": False,
+            "leg_contribution_reason": "INSUFFICIENT_CONTRIBUTION_HISTORY",
+        }
+
+    x_move = safe_float(log_x.iloc[-1] - log_x.iloc[-window - 1])
+    y_move = safe_float(beta * (log_y.iloc[-1] - log_y.iloc[-window - 1]))
+    x_contribution = abs(x_move)
+    y_contribution = abs(y_move)
+    total_contribution = x_contribution + y_contribution
+
+    if not np.isfinite(total_contribution) or total_contribution <= 0:
+        return {
+            "recent_x_contribution": x_contribution,
+            "recent_y_contribution": y_contribution,
+            "dominant_leg": "",
+            "dominant_leg_share": np.nan,
+            "passes_leg_contribution": False,
+            "leg_contribution_reason": "NO_RECENT_LEG_MOVEMENT",
+        }
+
+    dominant_leg = "X" if x_contribution >= y_contribution else "Y"
+    dominant_share = safe_float(max(x_contribution, y_contribution) / total_contribution)
+    strong_corr_override = pd.notna(corr_mean) and corr_mean >= LIVE_STRONG_CORR_OVERRIDE
+
+    reasons: List[str] = []
+    if dominant_share > LIVE_HARD_MAX_DOMINANT_LEG_SHARE:
+        reasons.append("EXTREME_ONE_LEG_DOMINANCE")
+    elif dominant_share > LIVE_MAX_DOMINANT_LEG_SHARE and not strong_corr_override:
+        reasons.append("ONE_LEG_DOMINANCE")
+
+    return {
+        "recent_x_contribution": safe_float(x_contribution),
+        "recent_y_contribution": safe_float(y_contribution),
+        "dominant_leg": dominant_leg,
+        "dominant_leg_share": dominant_share,
+        "passes_leg_contribution": len(reasons) == 0,
+        "leg_contribution_reason": "|".join(reasons) if reasons else "",
+    }
+
+
 def build_live_signal_row(
     pair_row: pd.Series,
     prices: pd.DataFrame,
@@ -1584,6 +1647,12 @@ def build_live_signal_row(
     zscore = compute_zscore(spread, z_window)
     position = build_positions(zscore, entry_z=entry_z, exit_z=exit_z)
     half_life = estimate_half_life(compute_spread(train_log_x, train_log_y, beta))
+    leg_contribution = compute_leg_contribution_metrics(
+        live_log_x,
+        live_log_y,
+        beta,
+        corr_mean=safe_float(live_stability["recent_corr_mean"]),
+    )
 
     latest_date = live_df.index[-1]
     latest_zscore = safe_float(zscore.iloc[-1]) if not zscore.empty else np.nan
@@ -1606,9 +1675,16 @@ def build_live_signal_row(
             robustness_score=safe_float(pair_row["robustness_score"]),
             live_action=current_action,
             passes_live_stability=bool(live_stability["passes_live_stability"]),
+            passes_leg_contribution=bool(leg_contribution["passes_leg_contribution"]),
         ),
         "passes_live_stability": bool(live_stability["passes_live_stability"]),
         "live_stability_reason": str(live_stability["live_stability_reason"]),
+        "passes_leg_contribution": bool(leg_contribution["passes_leg_contribution"]),
+        "leg_contribution_reason": str(leg_contribution["leg_contribution_reason"]),
+        "recent_x_contribution": safe_float(leg_contribution["recent_x_contribution"]),
+        "recent_y_contribution": safe_float(leg_contribution["recent_y_contribution"]),
+        "dominant_leg": str(leg_contribution["dominant_leg"]),
+        "dominant_leg_share": safe_float(leg_contribution["dominant_leg_share"]),
         "recent_corr_mean": safe_float(live_stability["recent_corr_mean"]),
         "recent_corr_std": safe_float(live_stability["recent_corr_std"]),
         "recent_beta_std": safe_float(live_stability["recent_beta_std"]),
@@ -1850,11 +1926,14 @@ def build_summary_report(ranked_df: pd.DataFrame, near_miss_df: pd.DataFrame, li
                     str(row["live_recommendation"]),
                     "YES" if bool(row["passes_live_stability"]) else "NO",
                     str(row["live_stability_reason"]),
+                    "YES" if bool(row.get("passes_leg_contribution", True)) else "NO",
+                    f"{safe_float(row.get('dominant_leg_share')):.2f}",
+                    str(row.get("leg_contribution_reason", "")),
                 ]
             )
         lines.extend(
             markdown_table(
-                ["Sector", "Pair", "Date", "Live Z", "Live Beta", "Live Half-Life", "Position", "Action", "Live Rec", "Stable", "Stability Reason"],
+                ["Sector", "Pair", "Date", "Live Z", "Live Beta", "Live Half-Life", "Position", "Action", "Live Rec", "Stable", "Stability Reason", "Leg OK", "Dominant Share", "Leg Reason"],
                 live_rows,
             )
         )

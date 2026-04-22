@@ -34,6 +34,12 @@ READY_OUTPUT_COLUMNS = [
     "live_half_life",
     "passes_live_stability",
     "live_stability_reason",
+    "passes_leg_contribution",
+    "leg_contribution_reason",
+    "recent_x_contribution",
+    "recent_y_contribution",
+    "dominant_leg",
+    "dominant_leg_share",
     "score",
     "confidence_score",
     "confidence_rank",
@@ -153,6 +159,17 @@ def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) ->
     if merged.empty:
         return merged
 
+    for column, default in {
+        "passes_leg_contribution": True,
+        "leg_contribution_reason": "",
+        "recent_x_contribution": np.nan,
+        "recent_y_contribution": np.nan,
+        "dominant_leg": "",
+        "dominant_leg_share": np.nan,
+    }.items():
+        if column not in merged.columns:
+            merged[column] = default
+
     merged["raw_weight"] = merged.apply(weight_from_row, axis=1)
     merged = merged.sort_values(
         by=["score", "confidence_score", "robustness_score", "oos_sharpe"],
@@ -201,7 +218,9 @@ def print_ready_summary(ready_pairs: pd.DataFrame) -> None:
         ]
     ].copy()
 
-    for column in ["portfolio_weight", "live_zscore", "live_beta", "score", "confidence_score", "robustness_score"]:
+    for column in ["portfolio_weight", "live_zscore", "live_beta", "dominant_leg_share", "score", "confidence_score", "robustness_score"]:
+        if column not in display_df.columns:
+            continue
         display_df[column] = display_df[column].astype(float).round(4)
 
     print("\nPaper Trade Ready Pairs")
