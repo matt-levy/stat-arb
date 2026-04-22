@@ -3,11 +3,23 @@ from unittest.mock import patch
 
 import pandas as pd
 
+from pair_checker import determine_operational_action
 from paper_trading_ready import build_ready_pairs, normalize_capped_weights, weight_from_row
 from run_pipeline import main as run_pipeline_main
 
 
 class ReadySignalTests(unittest.TestCase):
+    def test_unstable_active_research_ready_pair_is_hold_only(self):
+        recommendation = determine_operational_action(
+            research_verdict="STRONG_CANDIDATE",
+            confidence_score=9.0,
+            robustness_score=8.0,
+            live_action="LONG_SPREAD",
+            passes_live_stability=False,
+        )
+
+        self.assertEqual(recommendation, "HOLD_ONLY")
+
     def test_weight_from_row_rewards_stronger_research_inputs(self):
         weak_row = {
             "score": 1.0,

@@ -20,6 +20,37 @@ READY_LOG_OUTPUT = LOGS_DIR / "paper_trade_ready_log.csv"
 
 MAX_ACTIVE_PAIRS = 3
 MAX_PAIR_WEIGHT = 0.50
+READY_OUTPUT_COLUMNS = [
+    "run_timestamp",
+    "latest_date",
+    "sector",
+    "pair",
+    "live_recommendation",
+    "current_action",
+    "current_position",
+    "portfolio_weight",
+    "live_zscore",
+    "live_beta",
+    "live_half_life",
+    "passes_live_stability",
+    "live_stability_reason",
+    "score",
+    "confidence_score",
+    "confidence_rank",
+    "robustness_score",
+    "robustness_pass_rate",
+    "oos_sharpe",
+    "oos_return",
+    "oos_annualized_return",
+    "oos_max_drawdown",
+    "oos_trades",
+    "oos_unique_test_days",
+    "avg_coint_pvalue_passed",
+    "avg_adf_pvalue_passed",
+    "avg_half_life_passed",
+    "latest_price_x",
+    "latest_price_y",
+]
 
 
 # =========================
@@ -93,7 +124,7 @@ def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) ->
 
     ready_live = live_signals[live_signals["live_recommendation"].astype(str) == "PAPER_TRADE_READY"].copy()
     if ready_live.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=READY_OUTPUT_COLUMNS)
 
     ranked_subset = ranked_pairs[
         [
@@ -131,38 +162,7 @@ def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) ->
 
     merged["run_timestamp"] = datetime.now().isoformat(timespec="seconds")
 
-    ordered_columns = [
-        "run_timestamp",
-        "latest_date",
-        "sector",
-        "pair",
-        "live_recommendation",
-        "current_action",
-        "current_position",
-        "portfolio_weight",
-        "live_zscore",
-        "live_beta",
-        "live_half_life",
-        "passes_live_stability",
-        "live_stability_reason",
-        "score",
-        "confidence_score",
-        "confidence_rank",
-        "robustness_score",
-        "robustness_pass_rate",
-        "oos_sharpe",
-        "oos_return",
-        "oos_annualized_return",
-        "oos_max_drawdown",
-        "oos_trades",
-        "oos_unique_test_days",
-        "avg_coint_pvalue_passed",
-        "avg_adf_pvalue_passed",
-        "avg_half_life_passed",
-        "latest_price_x",
-        "latest_price_y",
-    ]
-    return merged[ordered_columns]
+    return merged[READY_OUTPUT_COLUMNS]
 
 
 def upsert_log(new_rows: pd.DataFrame, path: Path) -> None:
@@ -227,11 +227,12 @@ def main() -> None:
         return
 
     ready_pairs = build_ready_pairs(live_signals, ranked_pairs)
+    ready_pairs.to_csv(READY_SIGNALS_OUTPUT, index=False)
     if ready_pairs.empty:
         print("No PAPER_TRADE_READY pairs found in live signals.")
+        print(f"Cleared ready signals at: {READY_SIGNALS_OUTPUT.resolve()}")
         return
 
-    ready_pairs.to_csv(READY_SIGNALS_OUTPUT, index=False)
     upsert_log(ready_pairs, READY_LOG_OUTPUT)
     print_ready_summary(ready_pairs)
     print(f"\nSaved ready signals to: {READY_SIGNALS_OUTPUT.resolve()}")

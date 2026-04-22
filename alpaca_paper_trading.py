@@ -14,6 +14,7 @@ import requests
 
 
 READY_SIGNALS_INPUT = OUTPUTS_DIR / "paper_trade_ready_signals.csv"
+LIVE_SIGNALS_INPUT = OUTPUTS_DIR / "live_pair_signals.csv"
 RANKED_PAIRS_INPUT = OUTPUTS_DIR / "ranked_pairs_walk_forward.csv"
 ENV_FILE = Path(".env")
 
@@ -883,17 +884,80 @@ def build_positions_snapshot_rows(positions: List[Dict[str, object]]) -> pd.Data
     return pd.DataFrame(rows)
 
 
-def build_pair_lifecycle_rows(ready_universe: pd.DataFrame, pair_trade_plan: pd.DataFrame) -> pd.DataFrame:
+def extract_pair_symbols(pair_universe: pd.DataFrame) -> Set[str]:
+    """Return valid ticker symbols represented in a pair universe."""
+    if pair_universe.empty:
+        return set()
+
+    symbols: Set[str] = set()
+    for column in ["stock_x", "stock_y"]:
+        if column not in pair_universe.columns:
+            continue
+        symbols.update(
+            pair_universe[column]
+            .dropna()
+            .astype(str)
+            .str.upper()
+            .loc[lambda values: (values != "") & (values != "NAN")]
+        )
+    return symbols
+
+
+def get_flatten_symbols_from_live_universe(live_universe: pd.DataFrame, blocked_pairs: Set[str]) -> Set[str]:
+    """Select symbols that should be deliberately flattened this cycle."""
+    if live_universe.empty:
+        return set()
+
+    flatten_rows = pd.DataFrame()
+    if "current_position" in live_universe.columns:
+        current_position = pd.to_numeric(live_universe["current_position"], errors="coerce").fillna(0)
+        flatten_rows = pd.concat([flatten_rows, live_universe[current_position == 0]], ignore_index=True)
+
+    if blocked_pairs:
+        flatten_rows = pd.concat(
+            [
+                flatten_rows,
+                live_universe[live_universe["pair"].astype(str).isin(blocked_pairs)],
+            ],
+            ignore_index=True,
+        )
+
+    if flatten_rows.empty:
+        return set()
+
+    return extract_pair_symbols(flatten_rows.drop_duplicates(subset=["sector", "pair"], keep="last"))
+
+
+def build_pair_lifecycle_rows(pair_universe: pd.DataFrame, pair_trade_plan: pd.DataFrame) -> pd.DataFrame:
     """Record the daily intended lifecycle state for each candidate pair."""
-    if ready_universe.empty:
+    if pair_universe.empty:
         return pd.DataFrame()
 
-    lifecycle = ready_universe.copy()
+    lifecycle = pair_universe.copy()
     lifecycle["captured_at"] = datetime.now().isoformat(timespec="seconds")
     executable_pairs = set(pair_trade_plan["pair"].astype(str)) if not pair_trade_plan.empty else set()
-    lifecycle["execution_state"] = lifecycle["pair"].astype(str).apply(
-        lambda pair: "EXECUTABLE" if pair in executable_pairs else "NON_EXECUTABLE"
-    )
+    if "portfolio_weight" not in lifecycle.columns:
+        lifecycle["portfolio_weight"] = 0.0
+
+    if not pair_trade_plan.empty and "portfolio_weight" in pair_trade_plan.columns:
+        weight_map = pair_trade_plan.set_index("pair")["portfolio_weight"].to_dict()
+        lifecycle["portfolio_weight"] = lifecycle.apply(
+            lambda row: safe_float(weight_map.get(row.get("pair"), row.get("portfolio_weight", 0.0))),
+            axis=1,
+        )
+
+    def execution_state(row: pd.Series) -> str:
+        pair = str(row.get("pair", ""))
+        if pair in executable_pairs:
+            return "EXECUTABLE"
+        if str(row.get("live_recommendation", "")) == "HOLD_ONLY":
+            return "HOLD_ONLY"
+        current_position = safe_float(row.get("current_position"))
+        if np.isfinite(current_position) and int(current_position) == 0:
+            return "FLATTEN_IF_HELD"
+        return "NON_EXECUTABLE"
+
+    lifecycle["execution_state"] = lifecycle.apply(execution_state, axis=1)
 
     ordered_columns = [
         "captured_at",
@@ -968,18 +1032,23 @@ def main() -> None:
 
     config = load_config()
     ready_signals = load_csv(READY_SIGNALS_INPUT)
+    live_signals = load_csv(LIVE_SIGNALS_INPUT)
     ranked_pairs = load_csv(RANKED_PAIRS_INPUT)
 
-    if ready_signals.empty:
-        raise ValueError(f"Missing or empty ready signal file: {READY_SIGNALS_INPUT.resolve()}")
+    if ready_signals.empty and live_signals.empty:
+        raise ValueError(
+            f"Missing or empty signal files: {READY_SIGNALS_INPUT.resolve()} and {LIVE_SIGNALS_INPUT.resolve()}"
+        )
     if ranked_pairs.empty:
         raise ValueError(f"Missing or empty ranked pair file: {RANKED_PAIRS_INPUT.resolve()}")
 
-    staleness_days = get_signal_staleness_days(ready_signals)
+    signal_universe_source = live_signals if not live_signals.empty else ready_signals
+    staleness_days = get_signal_staleness_days(signal_universe_source)
 
     ready_universe = build_ready_universe(ready_signals, ranked_pairs)
-    if ready_universe.empty:
-        raise ValueError("No ticker legs could be resolved from the ready signal and ranked pair files.")
+    live_universe = build_ready_universe(signal_universe_source, ranked_pairs)
+    if live_universe.empty:
+        raise ValueError("No ticker legs could be resolved from the live signal and ranked pair files.")
 
     client = AlpacaClient(config)
     account = client.get_account()
@@ -1003,13 +1072,14 @@ def main() -> None:
     prior_trade_log = load_csv(TRADE_LOG_OUTPUT)
 
     blocked_pairs = set(config.pair_denylist)
-    blocked_pairs.update(get_pairs_in_cooldown(ready_universe, risk_rows))
+    if not ready_universe.empty:
+        blocked_pairs.update(get_pairs_in_cooldown(ready_universe, risk_rows))
     already_submitted_pairs = get_pairs_already_submitted_this_cycle(ready_universe, prior_trade_log)
     ready_universe = filter_blocked_pairs(ready_universe, blocked_pairs | already_submitted_pairs)
 
     leg_targets = build_leg_targets(ready_universe, deployable_capital, config)
     pair_trade_plan = build_pair_trade_plan(ready_universe, deployable_capital, config)
-    pair_lifecycle_df = build_pair_lifecycle_rows(ready_universe, pair_trade_plan)
+    pair_lifecycle_df = build_pair_lifecycle_rows(live_universe, pair_trade_plan)
     account_snapshot_df = build_account_snapshot_rows(account, deployable_capital)
     positions_snapshot_df = build_positions_snapshot_rows(positions)
 
@@ -1017,20 +1087,8 @@ def main() -> None:
     append_csv_rows(POSITIONS_SNAPSHOT_LOG_OUTPUT, positions_snapshot_df)
     append_csv_rows(PAIR_LIFECYCLE_LOG_OUTPUT, pair_lifecycle_df)
 
-    all_managed_symbols = sorted(
-        set(load_csv(READY_SIGNALS_INPUT).merge(load_csv(RANKED_PAIRS_INPUT)[["sector", "pair", "stock_x", "stock_y"]], on=["sector", "pair"], how="left")["stock_x"].astype(str).str.upper())
-        | set(load_csv(READY_SIGNALS_INPUT).merge(load_csv(RANKED_PAIRS_INPUT)[["sector", "pair", "stock_x", "stock_y"]], on=["sector", "pair"], how="left")["stock_y"].astype(str).str.upper())
-    )
-    flatten_symbols: Set[str] = set()
-    if blocked_pairs:
-        blocked_rows = load_csv(READY_SIGNALS_INPUT).merge(
-            load_csv(RANKED_PAIRS_INPUT)[["sector", "pair", "stock_x", "stock_y"]],
-            on=["sector", "pair"],
-            how="left",
-        )
-        blocked_rows = blocked_rows[blocked_rows["pair"].astype(str).isin(blocked_pairs)]
-        flatten_symbols.update(blocked_rows["stock_x"].astype(str).str.upper())
-        flatten_symbols.update(blocked_rows["stock_y"].astype(str).str.upper())
+    all_managed_symbols = sorted(extract_pair_symbols(live_universe))
+    flatten_symbols = get_flatten_symbols_from_live_universe(live_universe, blocked_pairs)
     if config.flatten_on_no_targets and leg_targets.empty:
         flatten_symbols.update(all_managed_symbols)
 
@@ -1048,6 +1106,8 @@ def main() -> None:
         print(f"Account buying power: ${account_buying_power:,.2f}")
     print(f"Deployable capital: ${deployable_capital:,.2f}")
     print(f"Preview saved to: {ORDER_PREVIEW_OUTPUT.resolve()}")
+    if flatten_symbols:
+        print(f"Symbols marked for flatten-if-held: {', '.join(sorted(flatten_symbols))}")
     if blocked_pairs:
         print(f"Blocked pairs this cycle: {', '.join(sorted(blocked_pairs))}")
     if already_submitted_pairs:
@@ -1058,7 +1118,7 @@ def main() -> None:
         else:
             print("No executable target legs were produced from the ready pairs. Existing positions will be left unchanged.")
     if staleness_days > config.max_signal_staleness_days:
-        latest_signal_date = pd.to_datetime(ready_signals["latest_date"]).max().date().isoformat()
+        latest_signal_date = pd.to_datetime(signal_universe_source["latest_date"]).max().date().isoformat()
         print(
             f"Warning: ready signals are stale by {staleness_days} days "
             f"(latest signal date {latest_signal_date})."
@@ -1085,7 +1145,7 @@ def main() -> None:
     if not cancelled_orders_df.empty:
         print(f"Cancelled {len(cancelled_orders_df)} open order(s) that conflicted with this rebalance.")
 
-    latest_signal_date = pd.to_datetime(ready_signals["latest_date"]).max().date().isoformat()
+    latest_signal_date = pd.to_datetime(signal_universe_source["latest_date"]).max().date().isoformat()
     execution_df = execute_orders(client, preview_df, signal_date=latest_signal_date)
     if execution_df.empty:
         print("No orders were submitted.")

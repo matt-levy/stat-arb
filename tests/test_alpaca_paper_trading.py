@@ -8,10 +8,13 @@ from alpaca_paper_trading import (
     AlpacaConfig,
     build_client_order_id,
     build_order_preview,
+    build_pair_lifecycle_rows,
     build_pair_risk_rows,
     build_trade_log_rows,
     cancel_conflicting_open_orders,
+    extract_pair_symbols,
     filter_blocked_pairs,
+    get_flatten_symbols_from_live_universe,
     get_pairs_already_submitted_this_cycle,
     get_pairs_in_cooldown,
 )
@@ -34,6 +37,110 @@ def make_config() -> AlpacaConfig:
 
 
 class AlpacaPaperTradingTests(unittest.TestCase):
+    def test_live_universe_marks_flat_pairs_for_flatten_but_not_hold_only_pairs(self):
+        live_universe = pd.DataFrame(
+            [
+                {
+                    "sector": "semis",
+                    "pair": "MU vs LRCX",
+                    "stock_x": "MU",
+                    "stock_y": "LRCX",
+                    "current_position": 1,
+                    "live_recommendation": "HOLD_ONLY",
+                },
+                {
+                    "sector": "banks",
+                    "pair": "BAC vs MS",
+                    "stock_x": "BAC",
+                    "stock_y": "MS",
+                    "current_position": 0,
+                    "live_recommendation": "WATCHLIST",
+                },
+            ]
+        )
+
+        self.assertEqual(extract_pair_symbols(live_universe), {"MU", "LRCX", "BAC", "MS"})
+        self.assertEqual(get_flatten_symbols_from_live_universe(live_universe, set()), {"BAC", "MS"})
+
+    def test_pair_lifecycle_distinguishes_executable_hold_only_and_flatten_if_held(self):
+        live_universe = pd.DataFrame(
+            [
+                {
+                    "latest_date": "2026-04-20",
+                    "sector": "banks",
+                    "pair": "C vs GS",
+                    "live_recommendation": "PAPER_TRADE_READY",
+                    "current_action": "SHORT_SPREAD",
+                    "current_position": -1,
+                    "portfolio_weight": 0.5,
+                    "live_zscore": 0.8,
+                    "live_beta": 1.0,
+                    "live_half_life": 11.0,
+                    "passes_live_stability": True,
+                    "live_stability_reason": "",
+                },
+                {
+                    "latest_date": "2026-04-20",
+                    "sector": "semis",
+                    "pair": "MU vs LRCX",
+                    "live_recommendation": "HOLD_ONLY",
+                    "current_action": "LONG_SPREAD",
+                    "current_position": 1,
+                    "portfolio_weight": 0.0,
+                    "live_zscore": -0.4,
+                    "live_beta": 1.4,
+                    "live_half_life": 6.5,
+                    "passes_live_stability": False,
+                    "live_stability_reason": "UNSTABLE_BETA",
+                },
+                {
+                    "latest_date": "2026-04-20",
+                    "sector": "banks",
+                    "pair": "BAC vs MS",
+                    "live_recommendation": "WATCHLIST",
+                    "current_action": "FLAT",
+                    "current_position": 0,
+                    "portfolio_weight": 0.0,
+                    "live_zscore": 0.0,
+                    "live_beta": 0.7,
+                    "live_half_life": 8.0,
+                    "passes_live_stability": True,
+                    "live_stability_reason": "",
+                },
+            ]
+        )
+        pair_trade_plan = pd.DataFrame([{"pair": "C vs GS"}])
+
+        lifecycle = build_pair_lifecycle_rows(live_universe, pair_trade_plan)
+        states = dict(zip(lifecycle["pair"], lifecycle["execution_state"]))
+
+        self.assertEqual(states["C vs GS"], "EXECUTABLE")
+        self.assertEqual(states["MU vs LRCX"], "HOLD_ONLY")
+        self.assertEqual(states["BAC vs MS"], "FLATTEN_IF_HELD")
+
+    def test_pair_lifecycle_defaults_missing_portfolio_weight_to_zero(self):
+        live_universe = pd.DataFrame(
+            [
+                {
+                    "latest_date": "2026-04-20",
+                    "sector": "semis",
+                    "pair": "MU vs LRCX",
+                    "live_recommendation": "HOLD_ONLY",
+                    "current_action": "LONG_SPREAD",
+                    "current_position": 1,
+                    "live_zscore": -0.4,
+                    "live_beta": 1.4,
+                    "live_half_life": 6.5,
+                    "passes_live_stability": False,
+                    "live_stability_reason": "UNSTABLE_BETA",
+                }
+            ]
+        )
+
+        lifecycle = build_pair_lifecycle_rows(live_universe, pd.DataFrame())
+
+        self.assertEqual(float(lifecycle.loc[0, "portfolio_weight"]), 0.0)
+
     def test_build_order_preview_does_not_flatten_without_explicit_symbols(self):
         preview_df = build_order_preview(
             leg_targets=pd.DataFrame(),

@@ -1438,17 +1438,23 @@ def determine_operational_action(
     """Convert research quality and current live context into an operational label."""
     actionable_signal = live_action in {"LONG_SPREAD", "SHORT_SPREAD"}
     watch_signal = live_action in {"WATCH_LONG", "WATCH_SHORT", "FLAT"}
-
-    if (
+    research_ready = (
         research_verdict == "STRONG_CANDIDATE"
         and pd.notna(confidence_score)
         and confidence_score >= 6.5
         and pd.notna(robustness_score)
         and robustness_score >= 6.0
-        and actionable_signal
+    )
+
+    if (
+        research_ready
         and passes_live_stability
+        and actionable_signal
     ):
         return "PAPER_TRADE_READY"
+
+    if research_ready and actionable_signal:
+        return "HOLD_ONLY"
 
     if (
         research_verdict in {"STRONG_CANDIDATE", "WEAK_CANDIDATE"}
