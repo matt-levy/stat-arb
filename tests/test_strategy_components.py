@@ -11,6 +11,7 @@ from pair_checker import (
 )
 from paper_trading_ready import (
     build_ready_pairs,
+    capped_absolute_weights,
     normalize_capped_weights,
     select_distinct_symbol_pairs,
     weight_from_row,
@@ -123,6 +124,12 @@ class ReadySignalTests(unittest.TestCase):
 
         self.assertAlmostEqual(weights.sum(), 1.0)
         self.assertLessEqual(weights.max(), 0.50 + 1e-9)
+
+    def test_capped_absolute_weights_preserve_unused_capacity(self):
+        weights = capped_absolute_weights(pd.Series([10.0, 5.0, 1.0]), cap=0.50)
+
+        self.assertLess(float(weights.sum()), 1.0)
+        self.assertLessEqual(float(weights.max()), 0.50 + 1e-9)
 
     def test_select_distinct_symbol_pairs_skips_overlapping_symbols(self):
         candidates = pd.DataFrame(
@@ -347,12 +354,125 @@ class ReadySignalTests(unittest.TestCase):
         ready_pairs = build_ready_pairs(live_signals, ranked_pairs)
 
         self.assertEqual(list(ready_pairs["pair"]), ["C vs GS", "JPM vs MS", "MU vs LRCX"])
-        self.assertAlmostEqual(float(ready_pairs["portfolio_weight"].sum()), 1.0)
+        self.assertLessEqual(float(ready_pairs["portfolio_weight"].sum()), 1.0 + 1e-9)
         self.assertLessEqual(float(ready_pairs["portfolio_weight"].max()), 0.50 + 1e-9)
         weights = ready_pairs.set_index("pair")["portfolio_weight"].to_dict()
         self.assertLess(float(weights["JPM vs MS"]), float(weights["MU vs LRCX"]))
         self.assertEqual(float(ready_pairs.set_index("pair").loc["JPM vs MS", "live_size_multiplier"]), 0.5)
         self.assertNotIn("XOM vs CVX", set(ready_pairs["pair"]))
+
+    def test_build_ready_pairs_leaves_idle_capital_when_only_borderline_pairs_survive(self):
+        live_signals = pd.DataFrame(
+            [
+                {
+                    "latest_date": "2026-04-15",
+                    "sector": "managed_care",
+                    "pair": "ELV vs HUM",
+                    "live_recommendation": "ELIGIBLE",
+                    "current_action": "SHORT_SPREAD",
+                    "current_position": -1,
+                    "live_zscore": 2.0,
+                    "live_beta": 0.2,
+                    "live_half_life": 18.0,
+                    "passes_live_stability": False,
+                    "live_stability_reason": "LOW_RECENT_CORR|UNSTABLE_CORR",
+                    "live_degradation_score": 1.4,
+                    "live_stability_tier": "BORDERLINE",
+                    "live_size_multiplier": 0.5,
+                    "passes_leg_contribution": True,
+                    "leg_contribution_reason": "",
+                    "recent_x_contribution": 0.01,
+                    "recent_y_contribution": 0.01,
+                    "dominant_leg": "X",
+                    "dominant_leg_share": 0.5,
+                    "has_event_window": False,
+                    "event_symbols": "",
+                    "event_reason": "",
+                    "latest_event_date": "",
+                    "event_days_from_signal": "",
+                    "latest_price_x": 340.0,
+                    "latest_price_y": 210.0,
+                },
+                {
+                    "latest_date": "2026-04-15",
+                    "sector": "banks",
+                    "pair": "BAC vs MS",
+                    "live_recommendation": "ELIGIBLE",
+                    "current_action": "LONG_SPREAD",
+                    "current_position": 1,
+                    "live_zscore": -1.8,
+                    "live_beta": 0.62,
+                    "live_half_life": 17.0,
+                    "passes_live_stability": False,
+                    "live_stability_reason": "UNSTABLE_BETA",
+                    "live_degradation_score": 0.6,
+                    "live_stability_tier": "BORDERLINE",
+                    "live_size_multiplier": 0.5,
+                    "passes_leg_contribution": True,
+                    "leg_contribution_reason": "",
+                    "recent_x_contribution": 0.01,
+                    "recent_y_contribution": 0.01,
+                    "dominant_leg": "X",
+                    "dominant_leg_share": 0.5,
+                    "has_event_window": False,
+                    "event_symbols": "",
+                    "event_reason": "",
+                    "latest_event_date": "",
+                    "event_days_from_signal": "",
+                    "latest_price_x": 52.0,
+                    "latest_price_y": 188.0,
+                },
+            ]
+        )
+        ranked_pairs = pd.DataFrame(
+            [
+                {
+                    "sector": "managed_care",
+                    "pair": "ELV vs HUM",
+                    "research_verdict": "PASS",
+                    "research_recommendation": "TRADE",
+                    "score": 10.4,
+                    "confidence_score": 9.1,
+                    "confidence_rank": 1,
+                    "robustness_score": 8.3,
+                    "robustness_pass_rate": 0.83,
+                    "oos_sharpe": 2.0,
+                    "oos_return": 0.36,
+                    "oos_annualized_return": 0.52,
+                    "oos_max_drawdown": -0.04,
+                    "oos_trades": 13,
+                    "oos_unique_test_days": 189,
+                    "avg_coint_pvalue_passed": 0.07,
+                    "avg_adf_pvalue_passed": 0.02,
+                    "avg_half_life_passed": 10.4,
+                },
+                {
+                    "sector": "banks",
+                    "pair": "BAC vs MS",
+                    "research_verdict": "PASS",
+                    "research_recommendation": "TRADE",
+                    "score": 5.8,
+                    "confidence_score": 10.1,
+                    "confidence_rank": 1,
+                    "robustness_score": 10.0,
+                    "robustness_pass_rate": 1.0,
+                    "oos_sharpe": 0.77,
+                    "oos_return": 0.16,
+                    "oos_annualized_return": 0.14,
+                    "oos_max_drawdown": -0.10,
+                    "oos_trades": 14,
+                    "oos_unique_test_days": 294,
+                    "avg_coint_pvalue_passed": 0.04,
+                    "avg_adf_pvalue_passed": 0.01,
+                    "avg_half_life_passed": 8.0,
+                },
+            ]
+        )
+
+        ready_pairs = build_ready_pairs(live_signals, ranked_pairs)
+
+        self.assertEqual(set(ready_pairs["live_stability_tier"]), {"BORDERLINE"})
+        self.assertLess(float(ready_pairs["portfolio_weight"].sum()), 1.0)
 
     def test_build_ready_pairs_returns_empty_without_matching_inputs(self):
         live_signals = pd.DataFrame(

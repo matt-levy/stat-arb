@@ -113,6 +113,22 @@ def normalize_capped_weights(raw_weights: pd.Series, cap: float) -> pd.Series:
     return weights / weights.sum()
 
 
+def capped_absolute_weights(raw_weights: pd.Series, cap: float) -> pd.Series:
+    """Convert raw weights into capped portfolio weights without forcing full deployment."""
+    weights = raw_weights.astype(float).copy().fillna(0.0)
+    if weights.empty:
+        return weights
+
+    positive_weights = weights.clip(lower=0.0)
+    total = positive_weights.sum()
+    if total <= 0:
+        return positive_weights
+
+    scaled = positive_weights / total
+    scaled = scaled.clip(upper=cap)
+    return scaled
+
+
 def weight_from_row(row: pd.Series) -> float:
     """Convert research quality into a simple portfolio weight score."""
     score_component = max(safe_float(row.get("score")), 0.0)
@@ -240,7 +256,7 @@ def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) ->
         ascending=[False, False, False, False],
     ).reset_index(drop=True)
     merged = select_distinct_symbol_pairs(merged, max_pairs=MAX_ACTIVE_PAIRS)
-    merged["portfolio_weight"] = normalize_capped_weights(merged["raw_weight"], MAX_PAIR_WEIGHT)
+    merged["portfolio_weight"] = capped_absolute_weights(merged["raw_weight"], MAX_PAIR_WEIGHT)
 
     merged["run_timestamp"] = datetime.now().isoformat(timespec="seconds")
 
