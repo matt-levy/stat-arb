@@ -34,6 +34,9 @@ READY_OUTPUT_COLUMNS = [
     "live_half_life",
     "passes_live_stability",
     "live_stability_reason",
+    "live_degradation_score",
+    "live_stability_tier",
+    "live_size_multiplier",
     "passes_leg_contribution",
     "leg_contribution_reason",
     "recent_x_contribution",
@@ -128,6 +131,14 @@ def weight_from_row(row: pd.Series) -> float:
     )
 
 
+def live_size_multiplier_from_row(row: pd.Series) -> float:
+    """Return a bounded live sizing multiplier from the signal row."""
+    multiplier = safe_float(row.get("live_size_multiplier", 1.0))
+    if not np.isfinite(multiplier):
+        return 1.0
+    return min(max(multiplier, 0.0), 1.0)
+
+
 def pair_symbols_from_row(row: pd.Series) -> List[str]:
     """Return normalized pair symbols from explicit columns or the pair label."""
     explicit_symbols = [
@@ -204,6 +215,9 @@ def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) ->
         return merged
 
     for column, default in {
+        "live_degradation_score": np.nan,
+        "live_stability_tier": "",
+        "live_size_multiplier": 1.0,
         "passes_leg_contribution": True,
         "leg_contribution_reason": "",
         "recent_x_contribution": np.nan,
@@ -220,6 +234,7 @@ def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) ->
             merged[column] = default
 
     merged["raw_weight"] = merged.apply(weight_from_row, axis=1)
+    merged["raw_weight"] = merged["raw_weight"] * merged.apply(live_size_multiplier_from_row, axis=1)
     merged = merged.sort_values(
         by=["score", "confidence_score", "robustness_score", "oos_sharpe"],
         ascending=[False, False, False, False],

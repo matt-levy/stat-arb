@@ -3,7 +3,12 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from pair_checker import compute_event_context, determine_operational_action
+from pair_checker import (
+    compute_event_context,
+    determine_live_stability_tier,
+    determine_operational_action,
+    live_stability_size_multiplier,
+)
 from paper_trading_ready import (
     build_ready_pairs,
     normalize_capped_weights,
@@ -21,9 +26,47 @@ class ReadySignalTests(unittest.TestCase):
             robustness_score=8.0,
             live_action="LONG_SPREAD",
             passes_live_stability=False,
+            live_stability_reason="LOW_RECENT_CORR|UNSTABLE_BETA",
+            live_degradation_score=3.5,
         )
 
         self.assertEqual(recommendation, "QUALIFIED_BUT_BLOCKED")
+
+    def test_single_mild_live_stability_failure_becomes_borderline_eligible(self):
+        recommendation = determine_operational_action(
+            research_verdict="STRONG_CANDIDATE",
+            confidence_score=9.0,
+            robustness_score=8.5,
+            live_action="LONG_SPREAD",
+            passes_live_stability=False,
+            live_stability_reason="UNSTABLE_BETA",
+            live_degradation_score=1.5,
+        )
+
+        self.assertEqual(recommendation, "ELIGIBLE")
+        self.assertEqual(
+            determine_live_stability_tier(
+                confidence_score=9.0,
+                robustness_score=8.5,
+                passes_live_stability=False,
+                live_stability_reason="UNSTABLE_BETA",
+                live_degradation_score=1.5,
+            ),
+            "BORDERLINE",
+        )
+        self.assertEqual(live_stability_size_multiplier("BORDERLINE"), 0.5)
+
+    def test_high_degradation_score_stays_blocked(self):
+        self.assertEqual(
+            determine_live_stability_tier(
+                confidence_score=9.0,
+                robustness_score=8.5,
+                passes_live_stability=False,
+                live_stability_reason="UNSTABLE_BETA",
+                live_degradation_score=3.2,
+            ),
+            "FAIL",
+        )
 
     def test_leg_contribution_failure_is_diagnostic_only(self):
         recommendation = determine_operational_action(
@@ -32,6 +75,8 @@ class ReadySignalTests(unittest.TestCase):
             robustness_score=8.0,
             live_action="SHORT_SPREAD",
             passes_live_stability=True,
+            live_stability_reason="",
+            live_degradation_score=0.0,
             passes_leg_contribution=False,
         )
 
@@ -108,6 +153,9 @@ class ReadySignalTests(unittest.TestCase):
                     "live_half_life": 10.0,
                     "passes_live_stability": True,
                     "live_stability_reason": "",
+                    "live_degradation_score": 0.0,
+                    "live_stability_tier": "PASS",
+                    "live_size_multiplier": 1.0,
                     "passes_leg_contribution": True,
                     "leg_contribution_reason": "",
                     "recent_x_contribution": 0.01,
@@ -125,15 +173,18 @@ class ReadySignalTests(unittest.TestCase):
                 {
                     "latest_date": "2026-04-15",
                     "sector": "banks",
-                    "pair": "JPM vs GS",
+                    "pair": "JPM vs MS",
                     "live_recommendation": "ELIGIBLE",
                     "current_action": "SHORT_SPREAD",
                     "current_position": -1,
                     "live_zscore": 1.5,
                     "live_beta": 0.45,
                     "live_half_life": 14.0,
-                    "passes_live_stability": True,
-                    "live_stability_reason": "",
+                    "passes_live_stability": False,
+                    "live_stability_reason": "UNSTABLE_BETA",
+                    "live_degradation_score": 1.5,
+                    "live_stability_tier": "BORDERLINE",
+                    "live_size_multiplier": 0.5,
                     "passes_leg_contribution": True,
                     "leg_contribution_reason": "",
                     "recent_x_contribution": 0.01,
@@ -146,7 +197,7 @@ class ReadySignalTests(unittest.TestCase):
                     "latest_event_date": "",
                     "event_days_from_signal": "",
                     "latest_price_x": 300.0,
-                    "latest_price_y": 900.0,
+                    "latest_price_y": 120.0,
                 },
                 {
                     "latest_date": "2026-04-15",
@@ -160,6 +211,9 @@ class ReadySignalTests(unittest.TestCase):
                     "live_half_life": 7.0,
                     "passes_live_stability": True,
                     "live_stability_reason": "",
+                    "live_degradation_score": 0.0,
+                    "live_stability_tier": "PASS",
+                    "live_size_multiplier": 1.0,
                     "passes_leg_contribution": True,
                     "leg_contribution_reason": "",
                     "recent_x_contribution": 0.01,
@@ -186,6 +240,9 @@ class ReadySignalTests(unittest.TestCase):
                     "live_half_life": 9.0,
                     "passes_live_stability": True,
                     "live_stability_reason": "",
+                    "live_degradation_score": 0.0,
+                    "live_stability_tier": "PASS",
+                    "live_size_multiplier": 1.0,
                     "passes_leg_contribution": True,
                     "leg_contribution_reason": "",
                     "recent_x_contribution": 0.01,
@@ -226,7 +283,7 @@ class ReadySignalTests(unittest.TestCase):
                 },
                 {
                     "sector": "banks",
-                    "pair": "JPM vs GS",
+                    "pair": "JPM vs MS",
                     "research_verdict": "PASS",
                     "research_recommendation": "TRADE",
                     "score": 6.0,
@@ -289,10 +346,12 @@ class ReadySignalTests(unittest.TestCase):
 
         ready_pairs = build_ready_pairs(live_signals, ranked_pairs)
 
-        self.assertEqual(list(ready_pairs["pair"]), ["C vs GS", "MU vs LRCX"])
+        self.assertEqual(list(ready_pairs["pair"]), ["C vs GS", "JPM vs MS", "MU vs LRCX"])
         self.assertAlmostEqual(float(ready_pairs["portfolio_weight"].sum()), 1.0)
         self.assertLessEqual(float(ready_pairs["portfolio_weight"].max()), 0.50 + 1e-9)
-        self.assertNotIn("JPM vs GS", set(ready_pairs["pair"]))
+        weights = ready_pairs.set_index("pair")["portfolio_weight"].to_dict()
+        self.assertLess(float(weights["JPM vs MS"]), float(weights["MU vs LRCX"]))
+        self.assertEqual(float(ready_pairs.set_index("pair").loc["JPM vs MS", "live_size_multiplier"]), 0.5)
         self.assertNotIn("XOM vs CVX", set(ready_pairs["pair"]))
 
     def test_build_ready_pairs_returns_empty_without_matching_inputs(self):

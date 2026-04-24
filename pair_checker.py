@@ -82,6 +82,10 @@ LIVE_LEG_CONTRIBUTION_WINDOW = 20
 LIVE_MAX_DOMINANT_LEG_SHARE = 0.80
 LIVE_HARD_MAX_DOMINANT_LEG_SHARE = 0.90
 LIVE_STRONG_CORR_OVERRIDE = 0.85
+LIVE_BORDERLINE_CONFIDENCE_MIN = 8.0
+LIVE_BORDERLINE_ROBUSTNESS_MIN = 8.0
+LIVE_BORDERLINE_SIZE_MULTIPLIER = 0.50
+LIVE_BORDERLINE_MAX_DEGRADATION_SCORE = 2.5
 EVENT_CALENDAR_CSV = DATA_DIR / "earnings_events.csv"
 EVENT_POST_COOLDOWN_BUSINESS_DAYS = 3
 EVENT_PRE_BLOCK_BUSINESS_DAYS = 1
@@ -1474,6 +1478,8 @@ def determine_operational_action(
     robustness_score: float,
     live_action: str,
     passes_live_stability: bool,
+    live_stability_reason: str = "",
+    live_degradation_score: float = np.nan,
     passes_leg_contribution: bool = True,
 ) -> str:
     """Convert research quality and current live context into an operational label.
@@ -1490,10 +1496,17 @@ def determine_operational_action(
         and pd.notna(robustness_score)
         and robustness_score >= 6.0
     )
+    stability_tier = determine_live_stability_tier(
+        confidence_score=confidence_score,
+        robustness_score=robustness_score,
+        passes_live_stability=passes_live_stability,
+        live_stability_reason=live_stability_reason,
+        live_degradation_score=live_degradation_score,
+    )
 
     if (
         research_ready
-        and passes_live_stability
+        and stability_tier in {"PASS", "BORDERLINE"}
         and actionable_signal
     ):
         return "ELIGIBLE"
@@ -1511,6 +1524,46 @@ def determine_operational_action(
         return "MONITOR"
 
     return "AVOID"
+
+
+def determine_live_stability_tier(
+    confidence_score: float,
+    robustness_score: float,
+    passes_live_stability: bool,
+    live_stability_reason: str,
+    live_degradation_score: float = np.nan,
+) -> str:
+    """Classify live stability into pass, conservative borderline, or fail."""
+    if passes_live_stability:
+        return "PASS"
+
+    reasons = [reason.strip() for reason in str(live_stability_reason).split("|") if reason.strip()]
+    if not np.isfinite(live_degradation_score):
+        return "FAIL"
+    if live_degradation_score > LIVE_BORDERLINE_MAX_DEGRADATION_SCORE:
+        return "FAIL"
+    if not reasons:
+        return "FAIL"
+    if any(reason in {"INSUFFICIENT_LIVE_HISTORY", "ELEVATED_SPREAD_VOL"} for reason in reasons):
+        return "FAIL"
+    if any(reason not in {"LOW_RECENT_CORR", "UNSTABLE_CORR", "UNSTABLE_BETA"} for reason in reasons):
+        return "FAIL"
+
+    if pd.isna(confidence_score) or confidence_score < LIVE_BORDERLINE_CONFIDENCE_MIN:
+        return "FAIL"
+    if pd.isna(robustness_score) or robustness_score < LIVE_BORDERLINE_ROBUSTNESS_MIN:
+        return "FAIL"
+
+    return "BORDERLINE"
+
+
+def live_stability_size_multiplier(stability_tier: str) -> float:
+    """Map live stability tier to a conservative portfolio sizing multiplier."""
+    if stability_tier == "BORDERLINE":
+        return LIVE_BORDERLINE_SIZE_MULTIPLIER
+    if stability_tier == "PASS":
+        return 1.0
+    return 0.0
 
 
 def determine_research_recommendation(
@@ -1547,6 +1600,7 @@ def compute_live_stability_metrics(
             "recent_corr_std": np.nan,
             "recent_beta_std": np.nan,
             "recent_spread_vol_ratio": np.nan,
+            "live_degradation_score": 10.0,
             "passes_live_stability": False,
             "live_stability_reason": "INSUFFICIENT_LIVE_HISTORY",
         }
@@ -1589,14 +1643,54 @@ def compute_live_stability_metrics(
     if pd.isna(spread_vol_ratio) or spread_vol_ratio > LIVE_MAX_RECENT_SPREAD_VOL_RATIO:
         reasons.append("ELEVATED_SPREAD_VOL")
 
+    degradation_score = compute_live_degradation_score(
+        corr_mean=corr_mean,
+        corr_std=corr_std,
+        recent_beta_std=recent_beta_std,
+        spread_vol_ratio=spread_vol_ratio,
+    )
+
     return {
         "recent_corr_mean": corr_mean,
         "recent_corr_std": corr_std,
         "recent_beta_std": recent_beta_std,
         "recent_spread_vol_ratio": spread_vol_ratio,
+        "live_degradation_score": degradation_score,
         "passes_live_stability": len(reasons) == 0,
         "live_stability_reason": "|".join(reasons) if reasons else "",
     }
+
+
+def compute_live_degradation_score(
+    corr_mean: float,
+    corr_std: float,
+    recent_beta_std: float,
+    spread_vol_ratio: float,
+) -> float:
+    """Score recent degradation on a 0-10 scale using smooth penalties."""
+    penalties: List[float] = []
+
+    if pd.isna(corr_mean):
+        penalties.append(3.0)
+    elif corr_mean < LIVE_MIN_RECENT_CORR_MEAN:
+        penalties.append(min((LIVE_MIN_RECENT_CORR_MEAN - corr_mean) / 0.10, 1.0) * 3.0)
+
+    if pd.isna(corr_std):
+        penalties.append(2.0)
+    elif corr_std > LIVE_MAX_RECENT_CORR_STD:
+        penalties.append(min((corr_std - LIVE_MAX_RECENT_CORR_STD) / 0.10, 1.0) * 2.0)
+
+    if pd.isna(recent_beta_std):
+        penalties.append(2.5)
+    elif recent_beta_std > LIVE_MAX_RECENT_BETA_STD:
+        penalties.append(min((recent_beta_std - LIVE_MAX_RECENT_BETA_STD) / 0.10, 1.0) * 2.5)
+
+    if pd.isna(spread_vol_ratio):
+        penalties.append(2.5)
+    elif spread_vol_ratio > LIVE_MAX_RECENT_SPREAD_VOL_RATIO:
+        penalties.append(min((spread_vol_ratio - LIVE_MAX_RECENT_SPREAD_VOL_RATIO) / 0.75, 1.0) * 2.5)
+
+    return safe_float(min(sum(penalties), 10.0))
 
 
 def compute_leg_contribution_metrics(
@@ -1775,6 +1869,13 @@ def build_live_signal_row(
         latest_date,
         event_calendar if event_calendar is not None else pd.DataFrame(),
     )
+    stability_tier = determine_live_stability_tier(
+        confidence_score=safe_float(pair_row["confidence_score"]),
+        robustness_score=safe_float(pair_row["robustness_score"]),
+        passes_live_stability=bool(live_stability["passes_live_stability"]),
+        live_stability_reason=str(live_stability["live_stability_reason"]),
+        live_degradation_score=safe_float(live_stability["live_degradation_score"]),
+    )
 
     return {
         "sector": str(pair_row["sector"]),
@@ -1792,10 +1893,15 @@ def build_live_signal_row(
             robustness_score=safe_float(pair_row["robustness_score"]),
             live_action=current_action,
             passes_live_stability=bool(live_stability["passes_live_stability"]),
+            live_stability_reason=str(live_stability["live_stability_reason"]),
+            live_degradation_score=safe_float(live_stability["live_degradation_score"]),
             passes_leg_contribution=bool(leg_contribution["passes_leg_contribution"]),
         ),
         "passes_live_stability": bool(live_stability["passes_live_stability"]),
         "live_stability_reason": str(live_stability["live_stability_reason"]),
+        "live_degradation_score": safe_float(live_stability["live_degradation_score"]),
+        "live_stability_tier": stability_tier,
+        "live_size_multiplier": live_stability_size_multiplier(stability_tier),
         "passes_leg_contribution": bool(leg_contribution["passes_leg_contribution"]),
         "leg_contribution_reason": str(leg_contribution["leg_contribution_reason"]),
         "recent_x_contribution": safe_float(leg_contribution["recent_x_contribution"]),
