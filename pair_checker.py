@@ -1496,10 +1496,10 @@ def determine_operational_action(
         and passes_live_stability
         and actionable_signal
     ):
-        return "PAPER_TRADE_READY"
+        return "ELIGIBLE"
 
     if research_ready and actionable_signal:
-        return "HOLD_ONLY"
+        return "QUALIFIED_BUT_BLOCKED"
 
     if (
         research_verdict in {"STRONG_CANDIDATE", "WEAK_CANDIDATE"}
@@ -1508,7 +1508,7 @@ def determine_operational_action(
         and passes_live_stability
         and watch_signal
     ):
-        return "WATCHLIST"
+        return "MONITOR"
 
     return "AVOID"
 
@@ -1526,10 +1526,10 @@ def determine_research_recommendation(
         and pd.notna(robustness_score)
         and robustness_score >= 6.0
     ):
-        return "PAPER_TRADE_READY"
+        return "ELIGIBLE"
 
     if research_verdict in {"STRONG_CANDIDATE", "WEAK_CANDIDATE"}:
-        return "WATCHLIST"
+        return "MONITOR"
 
     return "AVOID"
 
@@ -2029,7 +2029,7 @@ def build_summary_report(ranked_df: pd.DataFrame, near_miss_df: pd.DataFrame, li
         )
         action_counts = ranked_df["research_recommendation"].value_counts().to_dict()
         lines.append(
-            f"Research summary: {action_counts.get('PAPER_TRADE_READY', 0)} `PAPER_TRADE_READY`, {action_counts.get('WATCHLIST', 0)} `WATCHLIST`, {action_counts.get('AVOID', 0)} `AVOID`."
+            f"Research summary: {action_counts.get('ELIGIBLE', 0)} `ELIGIBLE`, {action_counts.get('MONITOR', 0)} `MONITOR`, {action_counts.get('AVOID', 0)} `AVOID`."
         )
         lines.append("Use `windows_passed` and `oos_trades` as confidence context, not as the main reason to prefer a pair.")
         lines.append("")

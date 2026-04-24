@@ -128,12 +128,51 @@ def weight_from_row(row: pd.Series) -> float:
     )
 
 
+def pair_symbols_from_row(row: pd.Series) -> List[str]:
+    """Return normalized pair symbols from explicit columns or the pair label."""
+    explicit_symbols = [
+        str(row.get("stock_x", "")).strip().upper(),
+        str(row.get("stock_y", "")).strip().upper(),
+    ]
+    explicit_symbols = [symbol for symbol in explicit_symbols if symbol]
+    if len(explicit_symbols) >= 2:
+        return explicit_symbols[:2]
+
+    pair_name = str(row.get("pair", ""))
+    if " vs " not in pair_name:
+        return explicit_symbols
+
+    parsed_symbols = [part.strip().upper() for part in pair_name.split(" vs ", 1)]
+    return [symbol for symbol in parsed_symbols if symbol]
+
+
+def select_distinct_symbol_pairs(candidates: pd.DataFrame, max_pairs: int) -> pd.DataFrame:
+    """Pick the highest-ranked pairs without reusing symbols across selections."""
+    if candidates.empty:
+        return candidates
+
+    selected_rows: List[int] = []
+    used_symbols = set()
+
+    for index, row in candidates.iterrows():
+        pair_symbols = set(pair_symbols_from_row(row))
+        if not pair_symbols or pair_symbols & used_symbols:
+            continue
+
+        selected_rows.append(index)
+        used_symbols.update(pair_symbols)
+        if len(selected_rows) >= max_pairs:
+            break
+
+    return candidates.loc[selected_rows].reset_index(drop=True)
+
+
 def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) -> pd.DataFrame:
     """Merge research and live outputs, keeping only currently approved pairs."""
     if live_signals.empty or ranked_pairs.empty:
         return pd.DataFrame()
 
-    ready_live = live_signals[live_signals["live_recommendation"].astype(str) == "PAPER_TRADE_READY"].copy()
+    ready_live = live_signals[live_signals["live_recommendation"].astype(str) == "ELIGIBLE"].copy()
     if ready_live.empty:
         return pd.DataFrame(columns=READY_OUTPUT_COLUMNS)
 
@@ -184,7 +223,8 @@ def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) ->
     merged = merged.sort_values(
         by=["score", "confidence_score", "robustness_score", "oos_sharpe"],
         ascending=[False, False, False, False],
-    ).head(MAX_ACTIVE_PAIRS).reset_index(drop=True)
+    ).reset_index(drop=True)
+    merged = select_distinct_symbol_pairs(merged, max_pairs=MAX_ACTIVE_PAIRS)
     merged["portfolio_weight"] = normalize_capped_weights(merged["raw_weight"], MAX_PAIR_WEIGHT)
 
     merged["run_timestamp"] = datetime.now().isoformat(timespec="seconds")
@@ -208,9 +248,9 @@ def upsert_log(new_rows: pd.DataFrame, path: Path) -> None:
 
 
 def print_ready_summary(ready_pairs: pd.DataFrame) -> None:
-    """Print the current paper-trade-ready set."""
+    """Print the current eligible set."""
     if ready_pairs.empty:
-        print("No PAPER_TRADE_READY pairs found in live signals.")
+        print("No ELIGIBLE pairs found in live signals.")
         return
 
     display_df = ready_pairs[
@@ -233,8 +273,8 @@ def print_ready_summary(ready_pairs: pd.DataFrame) -> None:
             continue
         display_df[column] = display_df[column].astype(float).round(4)
 
-    print("\nPaper Trade Ready Pairs")
-    print("-----------------------")
+    print("\nEligible Pairs")
+    print("--------------")
     print(display_df.to_string(index=False))
 
 
@@ -258,7 +298,7 @@ def main() -> None:
     ready_pairs = build_ready_pairs(live_signals, ranked_pairs)
     ready_pairs.to_csv(READY_SIGNALS_OUTPUT, index=False)
     if ready_pairs.empty:
-        print("No PAPER_TRADE_READY pairs found in live signals.")
+        print("No ELIGIBLE pairs found in live signals.")
         print(f"Cleared ready signals at: {READY_SIGNALS_OUTPUT.resolve()}")
         return
 

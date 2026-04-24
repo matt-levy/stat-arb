@@ -4,12 +4,17 @@ from unittest.mock import patch
 import pandas as pd
 
 from pair_checker import compute_event_context, determine_operational_action
-from paper_trading_ready import build_ready_pairs, normalize_capped_weights, weight_from_row
+from paper_trading_ready import (
+    build_ready_pairs,
+    normalize_capped_weights,
+    select_distinct_symbol_pairs,
+    weight_from_row,
+)
 from run_pipeline import main as run_pipeline_main
 
 
 class ReadySignalTests(unittest.TestCase):
-    def test_unstable_active_research_ready_pair_is_hold_only(self):
+    def test_unstable_active_research_ready_pair_is_qualified_but_blocked(self):
         recommendation = determine_operational_action(
             research_verdict="STRONG_CANDIDATE",
             confidence_score=9.0,
@@ -18,7 +23,7 @@ class ReadySignalTests(unittest.TestCase):
             passes_live_stability=False,
         )
 
-        self.assertEqual(recommendation, "HOLD_ONLY")
+        self.assertEqual(recommendation, "QUALIFIED_BUT_BLOCKED")
 
     def test_leg_contribution_failure_is_diagnostic_only(self):
         recommendation = determine_operational_action(
@@ -30,7 +35,7 @@ class ReadySignalTests(unittest.TestCase):
             passes_leg_contribution=False,
         )
 
-        self.assertEqual(recommendation, "PAPER_TRADE_READY")
+        self.assertEqual(recommendation, "ELIGIBLE")
 
     def test_event_context_detects_recent_public_event_window(self):
         events = pd.DataFrame(
@@ -74,6 +79,20 @@ class ReadySignalTests(unittest.TestCase):
         self.assertAlmostEqual(weights.sum(), 1.0)
         self.assertLessEqual(weights.max(), 0.50 + 1e-9)
 
+    def test_select_distinct_symbol_pairs_skips_overlapping_symbols(self):
+        candidates = pd.DataFrame(
+            [
+                {"pair": "C vs GS", "stock_x": "C", "stock_y": "GS", "score": 9.0},
+                {"pair": "JPM vs GS", "stock_x": "JPM", "stock_y": "GS", "score": 8.0},
+                {"pair": "MU vs LRCX", "stock_x": "MU", "stock_y": "LRCX", "score": 7.0},
+                {"pair": "XOM vs CVX", "stock_x": "XOM", "stock_y": "CVX", "score": 6.0},
+            ]
+        )
+
+        selected = select_distinct_symbol_pairs(candidates, max_pairs=3)
+
+        self.assertEqual(list(selected["pair"]), ["C vs GS", "MU vs LRCX", "XOM vs CVX"])
+
     def test_build_ready_pairs_keeps_only_ready_pairs_and_limits_count(self):
         live_signals = pd.DataFrame(
             [
@@ -81,7 +100,7 @@ class ReadySignalTests(unittest.TestCase):
                     "latest_date": "2026-04-15",
                     "sector": "banks",
                     "pair": "C vs GS",
-                    "live_recommendation": "PAPER_TRADE_READY",
+                    "live_recommendation": "ELIGIBLE",
                     "current_action": "SHORT_SPREAD",
                     "current_position": -1,
                     "live_zscore": 2.8,
@@ -107,7 +126,7 @@ class ReadySignalTests(unittest.TestCase):
                     "latest_date": "2026-04-15",
                     "sector": "banks",
                     "pair": "JPM vs GS",
-                    "live_recommendation": "PAPER_TRADE_READY",
+                    "live_recommendation": "ELIGIBLE",
                     "current_action": "SHORT_SPREAD",
                     "current_position": -1,
                     "live_zscore": 1.5,
@@ -133,7 +152,7 @@ class ReadySignalTests(unittest.TestCase):
                     "latest_date": "2026-04-15",
                     "sector": "semis",
                     "pair": "MU vs LRCX",
-                    "live_recommendation": "PAPER_TRADE_READY",
+                    "live_recommendation": "ELIGIBLE",
                     "current_action": "LONG_SPREAD",
                     "current_position": 1,
                     "live_zscore": -1.2,
@@ -159,7 +178,7 @@ class ReadySignalTests(unittest.TestCase):
                     "latest_date": "2026-04-15",
                     "sector": "oil",
                     "pair": "XOM vs CVX",
-                    "live_recommendation": "WATCHLIST",
+                    "live_recommendation": "MONITOR",
                     "current_action": "HOLD",
                     "current_position": 0,
                     "live_zscore": 0.2,
@@ -270,9 +289,10 @@ class ReadySignalTests(unittest.TestCase):
 
         ready_pairs = build_ready_pairs(live_signals, ranked_pairs)
 
-        self.assertEqual(list(ready_pairs["pair"]), ["C vs GS", "JPM vs GS", "MU vs LRCX"])
+        self.assertEqual(list(ready_pairs["pair"]), ["C vs GS", "MU vs LRCX"])
         self.assertAlmostEqual(float(ready_pairs["portfolio_weight"].sum()), 1.0)
         self.assertLessEqual(float(ready_pairs["portfolio_weight"].max()), 0.50 + 1e-9)
+        self.assertNotIn("JPM vs GS", set(ready_pairs["pair"]))
         self.assertNotIn("XOM vs CVX", set(ready_pairs["pair"]))
 
     def test_build_ready_pairs_returns_empty_without_matching_inputs(self):
@@ -282,7 +302,7 @@ class ReadySignalTests(unittest.TestCase):
                     "latest_date": "2026-04-15",
                     "sector": "banks",
                     "pair": "C vs GS",
-                    "live_recommendation": "WATCHLIST",
+                    "live_recommendation": "MONITOR",
                 }
             ]
         )

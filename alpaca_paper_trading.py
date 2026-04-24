@@ -1046,8 +1046,8 @@ def build_pair_lifecycle_rows(pair_universe: pd.DataFrame, pair_trade_plan: pd.D
         pair = str(row.get("pair", ""))
         if pair in executable_pairs:
             return "EXECUTABLE"
-        if str(row.get("live_recommendation", "")) == "HOLD_ONLY":
-            return "HOLD_ONLY"
+        if str(row.get("live_recommendation", "")) == "QUALIFIED_BUT_BLOCKED":
+            return "QUALIFIED_BUT_BLOCKED"
         current_position = safe_float(row.get("current_position"))
         if np.isfinite(current_position) and int(current_position) == 0:
             return "FLATTEN_IF_HELD"
@@ -1311,7 +1311,7 @@ def append_csv_rows(path: Path, rows: pd.DataFrame) -> None:
 
 def main() -> None:
     ensure_project_directories()
-    parser = argparse.ArgumentParser(description="Submit PAPER_TRADE_READY pair trades to Alpaca paper trading.")
+    parser = argparse.ArgumentParser(description="Submit ELIGIBLE pair trades to Alpaca paper trading.")
     parser.add_argument(
         "--execute",
         action="store_true",

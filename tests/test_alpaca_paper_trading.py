@@ -41,7 +41,7 @@ def make_config() -> AlpacaConfig:
 
 
 class AlpacaPaperTradingTests(unittest.TestCase):
-    def test_live_universe_marks_flat_pairs_for_flatten_but_not_hold_only_pairs(self):
+    def test_live_universe_marks_flat_pairs_for_flatten_but_not_blocked_pairs(self):
         live_universe = pd.DataFrame(
             [
                 {
@@ -50,7 +50,7 @@ class AlpacaPaperTradingTests(unittest.TestCase):
                     "stock_x": "MU",
                     "stock_y": "LRCX",
                     "current_position": 1,
-                    "live_recommendation": "HOLD_ONLY",
+                    "live_recommendation": "QUALIFIED_BUT_BLOCKED",
                 },
                 {
                     "sector": "banks",
@@ -58,7 +58,7 @@ class AlpacaPaperTradingTests(unittest.TestCase):
                     "stock_x": "BAC",
                     "stock_y": "MS",
                     "current_position": 0,
-                    "live_recommendation": "WATCHLIST",
+                    "live_recommendation": "MONITOR",
                 },
             ]
         )
@@ -66,14 +66,14 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         self.assertEqual(extract_pair_symbols(live_universe), {"MU", "LRCX", "BAC", "MS"})
         self.assertEqual(get_flatten_symbols_from_live_universe(live_universe, set()), {"BAC", "MS"})
 
-    def test_pair_lifecycle_distinguishes_executable_hold_only_and_flatten_if_held(self):
+    def test_pair_lifecycle_distinguishes_executable_blocked_and_flatten_if_held(self):
         live_universe = pd.DataFrame(
             [
                 {
                     "latest_date": "2026-04-20",
                     "sector": "banks",
                     "pair": "C vs GS",
-                    "live_recommendation": "PAPER_TRADE_READY",
+                    "live_recommendation": "ELIGIBLE",
                     "current_action": "SHORT_SPREAD",
                     "current_position": -1,
                     "portfolio_weight": 0.5,
@@ -87,7 +87,7 @@ class AlpacaPaperTradingTests(unittest.TestCase):
                     "latest_date": "2026-04-20",
                     "sector": "semis",
                     "pair": "MU vs LRCX",
-                    "live_recommendation": "HOLD_ONLY",
+                    "live_recommendation": "QUALIFIED_BUT_BLOCKED",
                     "current_action": "LONG_SPREAD",
                     "current_position": 1,
                     "portfolio_weight": 0.0,
@@ -101,7 +101,7 @@ class AlpacaPaperTradingTests(unittest.TestCase):
                     "latest_date": "2026-04-20",
                     "sector": "banks",
                     "pair": "BAC vs MS",
-                    "live_recommendation": "WATCHLIST",
+                    "live_recommendation": "MONITOR",
                     "current_action": "FLAT",
                     "current_position": 0,
                     "portfolio_weight": 0.0,
@@ -119,7 +119,7 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         states = dict(zip(lifecycle["pair"], lifecycle["execution_state"]))
 
         self.assertEqual(states["C vs GS"], "EXECUTABLE")
-        self.assertEqual(states["MU vs LRCX"], "HOLD_ONLY")
+        self.assertEqual(states["MU vs LRCX"], "QUALIFIED_BUT_BLOCKED")
         self.assertEqual(states["BAC vs MS"], "FLATTEN_IF_HELD")
 
     def test_pair_lifecycle_defaults_missing_portfolio_weight_to_zero(self):
@@ -129,7 +129,7 @@ class AlpacaPaperTradingTests(unittest.TestCase):
                     "latest_date": "2026-04-20",
                     "sector": "semis",
                     "pair": "MU vs LRCX",
-                    "live_recommendation": "HOLD_ONLY",
+                    "live_recommendation": "QUALIFIED_BUT_BLOCKED",
                     "current_action": "LONG_SPREAD",
                     "current_position": 1,
                     "live_zscore": -0.4,
@@ -324,7 +324,7 @@ class AlpacaPaperTradingTests(unittest.TestCase):
                     "stock_x": "C",
                     "stock_y": "GS",
                     "current_action": "SHORT_SPREAD",
-                    "live_recommendation": "PAPER_TRADE_READY",
+                    "live_recommendation": "ELIGIBLE",
                     "live_zscore": 0.03,
                     "live_beta": 1.07,
                 }
