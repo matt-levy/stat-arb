@@ -35,7 +35,7 @@ def make_config() -> AlpacaConfig:
         flatten_on_no_targets=False,
         pair_stop_loss_fraction=0.01,
         pair_denylist=[],
-        max_pair_notional_imbalance_pct=0.10,
+        max_pair_notional_imbalance_pct=0.20,
         near_exit_no_add_z=0.75,
     )
 
@@ -168,7 +168,7 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         self.assertEqual(list(preview["side"]), ["buy", "sell"])
         self.assertEqual(list(preview["order_qty"]), [22, 1])
 
-    def test_build_leg_targets_rejects_post_rounding_notional_imbalance(self):
+    def test_build_leg_targets_allows_moderate_post_rounding_notional_imbalance_at_new_default(self):
         ready_universe = pd.DataFrame(
             [
                 {
@@ -186,6 +186,28 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         )
 
         leg_targets = build_leg_targets(ready_universe, deployable_capital=4960.0, config=make_config())
+
+        self.assertFalse(leg_targets.empty)
+        self.assertLessEqual(float(leg_targets["notional_imbalance_pct"].max()), 0.20 + 1e-9)
+
+    def test_build_leg_targets_still_rejects_extreme_post_rounding_notional_imbalance(self):
+        ready_universe = pd.DataFrame(
+            [
+                {
+                    "pair": "ELV vs HUM",
+                    "stock_x": "ELV",
+                    "stock_y": "HUM",
+                    "current_action": "SHORT_SPREAD",
+                    "portfolio_weight": 0.5,
+                    "live_beta": 0.1678353228508005,
+                    "live_zscore": 2.0,
+                    "latest_price_x": 344.760009765625,
+                    "latest_price_y": 215.22999572753903,
+                }
+            ]
+        )
+
+        leg_targets = build_leg_targets(ready_universe, deployable_capital=5000.0, config=make_config())
 
         self.assertTrue(leg_targets.empty)
 

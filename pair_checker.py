@@ -98,17 +98,17 @@ SCORE_TRADE_WEIGHT = 0.05
 
 
 UNIVERSE: Dict[str, List[str]] = {
-    "banks": ["JPM", "BAC", "WFC", "C", "MS", "GS", "PNC", "USB", "BK", "SCHW"],
+    "banks": ["JPM", "BAC", "WFC", "C", "MS", "GS", "PNC", "USB", "BK", "SCHW", "TFC"],
     "payments": ["V", "MA", "AXP", "PYPL", "COF"],
-    "semis": ["NVDA", "AMD", "AVGO", "QCOM", "MU", "INTC", "AMAT", "LRCX", "KLAC", "TXN", "ADI"],
+    "semis": ["NVDA", "AMD", "AVGO", "QCOM", "MU", "INTC", "AMAT", "LRCX", "KLAC", "TXN", "ADI", "MRVL", "NXPI", "MCHP", "ON"],
     "oil_majors": ["XOM", "CVX"],
     "energy_e&p": ["COP", "EOG", "OXY", "DVN"],
     "energy_services": ["SLB", "HAL", "BKR"],
     "home_improvement": ["HD", "LOW"],
-    "railroads": ["UNP", "CSX", "NSC"],
-    "exchanges": ["ICE", "CME", "NDAQ"],
+    "railroads": ["UNP", "CSX", "NSC", "CNI", "CP"],
+    "exchanges": ["ICE", "CME", "NDAQ", "SPGI", "MCO", "MSCI"],
     "managed_care": ["UNH", "ELV", "CI", "HUM"],
-    "defense": ["LMT", "RTX", "NOC", "GD"],
+    "defense": ["LMT", "RTX", "NOC", "GD", "LHX"],
 }
 
 
