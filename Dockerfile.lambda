@@ -1,0 +1,14 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+COPY requirements.lambda.txt ${LAMBDA_TASK_ROOT}/requirements.lambda.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.lambda.txt
+
+COPY alpaca_paper_trading.py ${LAMBDA_TASK_ROOT}/
+COPY lambda_app.py ${LAMBDA_TASK_ROOT}/
+COPY pair_checker.py ${LAMBDA_TASK_ROOT}/
+COPY paper_trading_ready.py ${LAMBDA_TASK_ROOT}/
+COPY project_paths.py ${LAMBDA_TASK_ROOT}/
+COPY run_pipeline.py ${LAMBDA_TASK_ROOT}/
+COPY data ${LAMBDA_TASK_ROOT}/data
+
+CMD ["lambda_app.lambda_handler"]

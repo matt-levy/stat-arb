@@ -2,17 +2,22 @@ import unittest
 from unittest.mock import Mock
 
 import pandas as pd
+import requests
 
 from alpaca_paper_trading import (
     AlpacaClient,
     AlpacaConfig,
+    build_live_pair_risk_rows,
     build_client_order_id,
+    build_executable_ready_universe,
     build_leg_targets,
     build_order_preview,
     build_pair_lifecycle_rows,
+    build_pair_roundtrip_rows,
     build_pair_risk_rows,
     build_live_pair_attribution_rows,
     build_trade_log_rows,
+    execute_orders,
     cancel_conflicting_open_orders,
     extract_pair_symbols,
     filter_blocked_pairs,
@@ -37,11 +42,14 @@ def make_config() -> AlpacaConfig:
         pair_denylist=[],
         max_pair_notional_imbalance_pct=0.20,
         near_exit_no_add_z=0.75,
+        time_stop_half_lives=3.0,
+        time_stop_min_days=5,
+        reentry_cooldown_days=3,
     )
 
 
 class AlpacaPaperTradingTests(unittest.TestCase):
-    def test_live_universe_marks_flat_pairs_for_flatten_but_not_blocked_pairs(self):
+    def test_live_universe_marks_flat_and_blocked_pairs_for_flatten(self):
         live_universe = pd.DataFrame(
             [
                 {
@@ -64,7 +72,7 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         )
 
         self.assertEqual(extract_pair_symbols(live_universe), {"MU", "LRCX", "BAC", "MS"})
-        self.assertEqual(get_flatten_symbols_from_live_universe(live_universe, set()), {"BAC", "MS"})
+        self.assertEqual(get_flatten_symbols_from_live_universe(live_universe, set()), {"MU", "LRCX", "BAC", "MS"})
 
     def test_pair_lifecycle_distinguishes_executable_blocked_and_flatten_if_held(self):
         live_universe = pd.DataFrame(
@@ -210,6 +218,54 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         leg_targets = build_leg_targets(ready_universe, deployable_capital=5000.0, config=make_config())
 
         self.assertTrue(leg_targets.empty)
+
+    def test_build_executable_ready_universe_redistributes_failed_pair_weight(self):
+        ready_universe = pd.DataFrame(
+            [
+                {
+                    "pair": "EXPENSIVE vs TINY",
+                    "stock_x": "EXPENSIVE",
+                    "stock_y": "TINY",
+                    "current_action": "SHORT_SPREAD",
+                    "portfolio_weight": 0.2,
+                    "live_beta": 0.1,
+                    "live_zscore": 2.3,
+                    "latest_price_x": 600.0,
+                    "latest_price_y": 500.0,
+                },
+                {
+                    "pair": "PAIR A",
+                    "stock_x": "AAA",
+                    "stock_y": "BBB",
+                    "current_action": "LONG_SPREAD",
+                    "portfolio_weight": 0.3,
+                    "live_beta": 1.0,
+                    "live_zscore": -1.8,
+                    "latest_price_x": 100.0,
+                    "latest_price_y": 100.0,
+                },
+                {
+                    "pair": "PAIR B",
+                    "stock_x": "CCC",
+                    "stock_y": "DDD",
+                    "current_action": "SHORT_SPREAD",
+                    "portfolio_weight": 0.5,
+                    "live_beta": 1.0,
+                    "live_zscore": 1.9,
+                    "latest_price_x": 80.0,
+                    "latest_price_y": 80.0,
+                },
+            ]
+        )
+
+        executable = build_executable_ready_universe(ready_universe, deployable_capital=1000.0, config=make_config())
+
+        self.assertEqual(set(executable["pair"]), {"PAIR A", "PAIR B"})
+        self.assertAlmostEqual(float(executable["portfolio_weight"].sum()), 1.0, places=6)
+        pair_a_weight = float(executable.loc[executable["pair"] == "PAIR A", "portfolio_weight"].iloc[0])
+        pair_b_weight = float(executable.loc[executable["pair"] == "PAIR B", "portfolio_weight"].iloc[0])
+        self.assertAlmostEqual(pair_a_weight, 0.375, places=6)
+        self.assertAlmostEqual(pair_b_weight, 0.625, places=6)
 
     def test_build_order_preview_does_not_increase_near_exit_exposure(self):
         leg_targets = pd.DataFrame(
@@ -392,6 +448,41 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         self.assertEqual(list(trade_log["pair"]), ["C vs GS", "JPM vs GS"])
         self.assertEqual(list(trade_log["order_ids"]), ["abc", "abc"])
 
+    def test_execute_orders_retries_with_unique_client_order_id_on_duplicate(self):
+        client = Mock()
+        duplicate_exc = requests.HTTPError(
+            '422 Unprocessable Entity for POST /v2/orders: {"code":40010001,"message":"client_order_id must be unique"}'
+        )
+        client.submit_order.side_effect = [
+            duplicate_exc,
+            {"id": "retry-order", "status": "accepted", "filled_qty": "0", "filled_avg_price": None},
+        ]
+        preview_df = pd.DataFrame(
+            [
+                {
+                    "symbol": "C",
+                    "side": "sell",
+                    "order_qty": 17,
+                    "target_qty": 0,
+                    "current_qty": 17,
+                    "source_pairs": "",
+                }
+            ]
+        )
+
+        execution_df = execute_orders(client, preview_df, signal_date="2026-05-19")
+
+        self.assertEqual(client.submit_order.call_count, 2)
+        self.assertEqual(list(execution_df["alpaca_order_id"]), ["retry-order"])
+        self.assertNotEqual(
+            client.submit_order.call_args_list[0].kwargs["client_order_id"],
+            client.submit_order.call_args_list[1].kwargs["client_order_id"],
+        )
+        self.assertEqual(
+            execution_df.loc[0, "retried_client_order_id"],
+            client.submit_order.call_args_list[1].kwargs["client_order_id"],
+        )
+
     def test_cancel_conflicting_open_orders_only_cancels_symbols_in_preview(self):
         client = Mock()
         client.list_open_orders.return_value = [
@@ -465,6 +556,115 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         cooldown_pairs = get_pairs_in_cooldown(ready_universe, risk_rows)
 
         self.assertEqual(cooldown_pairs, {"C vs GS"})
+
+    def test_get_pairs_in_cooldown_blocks_recent_time_stop_reentry(self):
+        ready_universe = pd.DataFrame(
+            [
+                {"pair": "C vs GS", "latest_date": "2026-04-16"},
+                {"pair": "MU vs LRCX", "latest_date": "2026-04-16"},
+            ]
+        )
+        risk_rows = pd.DataFrame(
+            [
+                {"pair": "C vs GS", "latest_date": "2026-04-14", "event_type": "TIME_STOP"},
+                {"pair": "MU vs LRCX", "latest_date": "2026-04-10", "event_type": "TIME_STOP"},
+            ]
+        )
+
+        cooldown_pairs = get_pairs_in_cooldown(ready_universe, risk_rows, cooldown_days=3)
+
+        self.assertEqual(cooldown_pairs, {"C vs GS"})
+
+    def test_build_live_pair_risk_rows_triggers_time_stop_for_stale_loser(self):
+        live_universe = pd.DataFrame(
+            [
+                {
+                    "latest_date": "2026-04-20",
+                    "pair": "C vs GS",
+                    "current_action": "LONG_SPREAD",
+                    "current_position": 1,
+                    "live_half_life": 2.0,
+                }
+            ]
+        )
+        attribution_df = pd.DataFrame(
+            [
+                {
+                    "pair": "C vs GS",
+                    "pair_unrealized_pl": -12.0,
+                }
+            ]
+        )
+        lifecycle_log = pd.DataFrame(
+            [
+                {"captured_at": "2026-04-14T16:00:00", "pair": "C vs GS", "current_action": "LONG_SPREAD", "current_position": 1},
+                {"captured_at": "2026-04-15T16:00:00", "pair": "C vs GS", "current_action": "LONG_SPREAD", "current_position": 1},
+            ]
+        )
+        config = make_config()
+
+        risk_rows = build_live_pair_risk_rows(live_universe, attribution_df, lifecycle_log, account_equity=10_000.0, config=config)
+
+        self.assertIn("TIME_STOP", set(risk_rows["event_type"]))
+
+    def test_build_pair_roundtrip_rows_summarizes_closed_cycle(self):
+        lifecycle_log = pd.DataFrame(
+            [
+                {
+                    "captured_at": "2026-04-14T16:00:00",
+                    "latest_date": "2026-04-14",
+                    "pair": "C vs GS",
+                    "current_action": "LONG_SPREAD",
+                    "current_position": 1,
+                    "portfolio_weight": 0.5,
+                    "live_zscore": -1.8,
+                    "live_beta": 1.1,
+                    "live_half_life": 6.0,
+                    "execution_state": "EXECUTABLE",
+                },
+                {
+                    "captured_at": "2026-04-16T16:00:00",
+                    "latest_date": "2026-04-16",
+                    "pair": "C vs GS",
+                    "current_action": "FLAT",
+                    "current_position": 0,
+                    "portfolio_weight": 0.0,
+                    "live_zscore": -0.1,
+                    "live_beta": 1.0,
+                    "live_half_life": 6.0,
+                    "execution_state": "FLATTEN_IF_HELD",
+                },
+            ]
+        )
+        attribution_log = pd.DataFrame(
+            [
+                {
+                    "captured_at": "2026-04-14T16:05:00",
+                    "pair": "C vs GS",
+                    "long_symbol": "C",
+                    "short_symbol": "GS",
+                    "long_unrealized_pl": -5.0,
+                    "short_unrealized_pl": 3.0,
+                    "pair_unrealized_pl": -2.0,
+                },
+                {
+                    "captured_at": "2026-04-15T16:05:00",
+                    "pair": "C vs GS",
+                    "long_symbol": "C",
+                    "short_symbol": "GS",
+                    "long_unrealized_pl": 4.0,
+                    "short_unrealized_pl": 6.0,
+                    "pair_unrealized_pl": 10.0,
+                },
+            ]
+        )
+        risk_rows = pd.DataFrame([{"pair": "C vs GS", "latest_date": "2026-04-16", "event_type": "TIME_STOP"}])
+
+        roundtrips = build_pair_roundtrip_rows(lifecycle_log, attribution_log, risk_rows)
+
+        self.assertEqual(list(roundtrips["pair"]), ["C vs GS"])
+        self.assertEqual(list(roundtrips["exit_reason"]), ["TIME_STOP"])
+        self.assertEqual(list(roundtrips["hold_days"]), [2])
 
     def test_filter_blocked_pairs_removes_denylisted_pair(self):
         ready_universe = pd.DataFrame(

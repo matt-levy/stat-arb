@@ -5,9 +5,12 @@ import pandas as pd
 
 from pair_checker import (
     compute_event_context,
+    leg_contribution_size_multiplier,
+    determine_plot_window,
     determine_live_stability_tier,
     determine_operational_action,
     live_stability_size_multiplier,
+    select_pairs_for_plotting,
 )
 from paper_trading_ready import (
     build_ready_pairs,
@@ -69,7 +72,7 @@ class ReadySignalTests(unittest.TestCase):
             "FAIL",
         )
 
-    def test_leg_contribution_failure_is_diagnostic_only(self):
+    def test_extreme_leg_contribution_failure_blocks_active_signal(self):
         recommendation = determine_operational_action(
             research_verdict="STRONG_CANDIDATE",
             confidence_score=9.0,
@@ -79,9 +82,26 @@ class ReadySignalTests(unittest.TestCase):
             live_stability_reason="",
             live_degradation_score=0.0,
             passes_leg_contribution=False,
+            leg_contribution_reason="EXTREME_ONE_LEG_DOMINANCE",
+        )
+
+        self.assertEqual(recommendation, "QUALIFIED_BUT_BLOCKED")
+
+    def test_mild_leg_dominance_stays_eligible_but_sizes_down(self):
+        recommendation = determine_operational_action(
+            research_verdict="STRONG_CANDIDATE",
+            confidence_score=9.0,
+            robustness_score=8.0,
+            live_action="SHORT_SPREAD",
+            passes_live_stability=True,
+            live_stability_reason="",
+            live_degradation_score=0.0,
+            passes_leg_contribution=False,
+            leg_contribution_reason="ONE_LEG_DOMINANCE",
         )
 
         self.assertEqual(recommendation, "ELIGIBLE")
+        self.assertEqual(leg_contribution_size_multiplier(False, "ONE_LEG_DOMINANCE"), 0.5)
 
     def test_event_context_detects_recent_public_event_window(self):
         events = pd.DataFrame(
@@ -514,8 +534,46 @@ class ReadySignalTests(unittest.TestCase):
 
         self.assertTrue(ready_pairs.empty)
 
+    def test_select_pairs_for_plotting_keeps_only_active_pairs_in_live_order(self):
+        ranked_pairs = pd.DataFrame(
+            [
+                {"pair": "C vs GS", "stock_x": "C", "stock_y": "GS", "latest_beta": 1.0},
+                {"pair": "MU vs LRCX", "stock_x": "MU", "stock_y": "LRCX", "latest_beta": 1.3},
+                {"pair": "BAC vs MS", "stock_x": "BAC", "stock_y": "MS", "latest_beta": 0.7},
+            ]
+        )
+        live_signals = pd.DataFrame(
+            [
+                {"pair": "MU vs LRCX", "current_position": 1},
+                {"pair": "BAC vs MS", "current_position": 0},
+                {"pair": "C vs GS", "current_position": -1},
+            ]
+        )
+
+        selected = select_pairs_for_plotting(ranked_pairs, live_signals)
+
+        self.assertEqual(list(selected["pair"]), ["MU vs LRCX", "C vs GS"])
+
 
 class RunPipelineTests(unittest.TestCase):
+    def test_determine_plot_window_starts_before_current_trade_entry(self):
+        index = pd.date_range("2026-05-01", periods=8, freq="B")
+        position = pd.Series([0, 0, 1, 1, 1, 1, 1, 1], index=index)
+
+        visible_index, entry_timestamp = determine_plot_window(position, pre_entry_bars=2, fallback_bars=4)
+
+        self.assertEqual(entry_timestamp, index[2])
+        self.assertEqual(list(visible_index), list(index[0:]))
+
+    def test_determine_plot_window_falls_back_when_flat(self):
+        index = pd.date_range("2026-05-01", periods=8, freq="B")
+        position = pd.Series([0, 0, 0, 0, 0, 0, 0, 0], index=index)
+
+        visible_index, entry_timestamp = determine_plot_window(position, pre_entry_bars=2, fallback_bars=3)
+
+        self.assertIsNone(entry_timestamp)
+        self.assertEqual(list(visible_index), list(index[-3:]))
+
     @patch("run_pipeline.run_step")
     @patch("sys.argv", ["run_pipeline.py", "--skip-research", "--skip-ready", "--execute", "--allow-stale"])
     def test_main_only_runs_alpaca_step_with_requested_flags(self, run_step_mock):

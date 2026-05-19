@@ -1,0 +1,10 @@
+.git
+.pytest_cache
+.venv
+__pycache__
+data/*.parquet
+logs
+outputs
+reports
+pytest-cache-files-*
+tests

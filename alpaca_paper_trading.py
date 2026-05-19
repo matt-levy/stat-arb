@@ -3,6 +3,7 @@ import hashlib
 import os
 from dataclasses import dataclass
 from datetime import date, datetime
+from itertools import combinations
 from pathlib import Path
 
 from project_paths import LOGS_DIR, OUTPUTS_DIR, ensure_project_directories
@@ -27,6 +28,8 @@ ORDER_FILL_LOG_OUTPUT = LOGS_DIR / "alpaca_order_fills.csv"
 PAIR_LIFECYCLE_LOG_OUTPUT = LOGS_DIR / "alpaca_pair_lifecycle_log.csv"
 PAIR_RISK_EVENTS_LOG_OUTPUT = LOGS_DIR / "alpaca_pair_risk_events.csv"
 PAIR_ATTRIBUTION_OUTPUT = OUTPUTS_DIR / "alpaca_pair_attribution.csv"
+PAIR_ATTRIBUTION_LOG_OUTPUT = LOGS_DIR / "alpaca_pair_attribution_log.csv"
+PAIR_ROUNDTRIP_LOG_OUTPUT = LOGS_DIR / "alpaca_pair_roundtrip_log.csv"
 
 DEFAULT_BASE_URL = "https://paper-api.alpaca.markets"
 DEFAULT_DRY_RUN = True
@@ -34,9 +37,12 @@ DEFAULT_GROSS_EXPOSURE_FRACTION = 0.90
 DEFAULT_BUYING_POWER_USAGE_FRACTION = 0.50
 DEFAULT_MIN_LEG_NOTIONAL = 100.0
 DEFAULT_MAX_SIGNAL_STALENESS_DAYS = 3
-DEFAULT_PAIR_STOP_LOSS_FRACTION = 0.0
+DEFAULT_PAIR_STOP_LOSS_FRACTION = 0.0075
 DEFAULT_MAX_PAIR_NOTIONAL_IMBALANCE_PCT = 0.20
 DEFAULT_NEAR_EXIT_NO_ADD_Z = 0.75
+DEFAULT_TIME_STOP_HALF_LIVES = 3.0
+DEFAULT_TIME_STOP_MIN_DAYS = 5
+DEFAULT_REENTRY_COOLDOWN_DAYS = 3
 REQUEST_TIMEOUT_SECONDS = 20
 ACTIVE_EXECUTION_STATUSES = {
     "accepted",
@@ -67,6 +73,9 @@ class AlpacaConfig:
     pair_denylist: List[str]
     max_pair_notional_imbalance_pct: float
     near_exit_no_add_z: float
+    time_stop_half_lives: float
+    time_stop_min_days: int
+    reentry_cooldown_days: int
 
 
 def load_env_file(path: Path) -> None:
@@ -167,6 +176,9 @@ def load_config() -> AlpacaConfig:
             0.0,
         ),
         near_exit_no_add_z=max(parse_float_env("ALPACA_NEAR_EXIT_NO_ADD_Z", DEFAULT_NEAR_EXIT_NO_ADD_Z), 0.0),
+        time_stop_half_lives=max(parse_float_env("ALPACA_TIME_STOP_HALF_LIVES", DEFAULT_TIME_STOP_HALF_LIVES), 0.0),
+        time_stop_min_days=max(parse_int_env("ALPACA_TIME_STOP_MIN_DAYS", DEFAULT_TIME_STOP_MIN_DAYS), 0),
+        reentry_cooldown_days=max(parse_int_env("ALPACA_REENTRY_COOLDOWN_DAYS", DEFAULT_REENTRY_COOLDOWN_DAYS), 0),
     )
 
 
@@ -176,6 +188,11 @@ def safe_float(value: object) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float("nan")
+
+
+def parse_timestamp(value: object) -> pd.Timestamp:
+    """Parse a timestamp-like value into a pandas timestamp."""
+    return pd.to_datetime(value, errors="coerce")
 
 
 def load_csv(path: Path) -> pd.DataFrame:
@@ -329,6 +346,14 @@ def build_client_order_id(
     return f"pairs-{normalized_date}-{normalized_symbol.lower()}-{normalized_side}-{digest}"
 
 
+def build_retry_client_order_id(base_client_order_id: str) -> str:
+    """Build a unique retry client order id when the deterministic id was already used."""
+    normalized_base = str(base_client_order_id).strip() or "pairs-retry"
+    retry_suffix = datetime.now().strftime("%H%M%S")
+    retry_digest = hashlib.sha1(f"{normalized_base}|{datetime.now().isoformat(timespec='microseconds')}".encode("utf-8")).hexdigest()[:6]
+    return f"{normalized_base}-r{retry_suffix}{retry_digest}"[:48]
+
+
 def determine_deployable_capital(account: Dict[str, object], config: AlpacaConfig) -> float:
     """Cap deployment by both equity budget and currently available buying power."""
     equity = safe_float(account.get("equity"))
@@ -428,14 +453,93 @@ def calculate_pair_sizing(row: pd.Series, deployable_capital: float, config: Alp
     }
 
 
+def build_executable_ready_universe(
+    ready_universe: pd.DataFrame,
+    deployable_capital: float,
+    config: AlpacaConfig,
+) -> pd.DataFrame:
+    """Redistribute ready-pair weights across the best fully executable subset."""
+    if ready_universe.empty:
+        return pd.DataFrame()
+
+    candidates = ready_universe.copy().reset_index(drop=True)
+    candidates["portfolio_weight"] = pd.to_numeric(candidates.get("portfolio_weight"), errors="coerce").fillna(0.0)
+    candidates = candidates[candidates["portfolio_weight"] > 0].reset_index(drop=True)
+    if candidates.empty:
+        return pd.DataFrame(columns=ready_universe.columns)
+    candidates["_base_portfolio_weight"] = candidates["portfolio_weight"]
+
+    target_weight_budget = min(float(candidates["portfolio_weight"].sum()), 1.0)
+    if target_weight_budget <= 0:
+        return pd.DataFrame(columns=ready_universe.columns)
+
+    best_subset: Optional[pd.DataFrame] = None
+    best_gross_notional = -1.0
+    best_score = -1.0
+    best_pair_count = -1
+
+    def allocate_subset(subset: pd.DataFrame) -> Optional[pd.DataFrame]:
+        base_weights = pd.to_numeric(subset["_base_portfolio_weight"], errors="coerce").fillna(0.0)
+        base_weight_sum = float(base_weights.sum())
+        if base_weight_sum <= 0:
+            return None
+
+        allocated = subset.copy()
+        allocated["portfolio_weight"] = base_weights / base_weight_sum * target_weight_budget
+        sizing_rows: List[Dict[str, object]] = []
+        total_gross_notional = 0.0
+
+        for _, pair_row in allocated.iterrows():
+            sizing = calculate_pair_sizing(pair_row, deployable_capital, config)
+            if sizing is None:
+                return None
+            sizing_rows.append(sizing)
+            total_gross_notional += safe_float(sizing.get("actual_gross_notional"))
+
+        allocated["_actual_gross_notional"] = [safe_float(row.get("actual_gross_notional")) for row in sizing_rows]
+        return allocated
+
+    candidate_indexes = list(candidates.index)
+    for subset_size in range(len(candidate_indexes), 0, -1):
+        for subset_indexes in combinations(candidate_indexes, subset_size):
+            subset = candidates.loc[list(subset_indexes)].reset_index(drop=True)
+            allocated_subset = allocate_subset(subset)
+            if allocated_subset is None:
+                continue
+
+            gross_notional = float(pd.to_numeric(allocated_subset["_actual_gross_notional"], errors="coerce").fillna(0.0).sum())
+            score = float(pd.to_numeric(allocated_subset["_base_portfolio_weight"], errors="coerce").fillna(0.0).sum())
+            pair_count = len(allocated_subset)
+            if (
+                score > best_score + 1e-9
+                or (
+                    abs(score - best_score) <= 1e-9
+                    and (
+                        gross_notional > best_gross_notional + 1e-9
+                        or (abs(gross_notional - best_gross_notional) <= 1e-9 and pair_count > best_pair_count)
+                    )
+                )
+            ):
+                best_subset = allocated_subset
+                best_gross_notional = gross_notional
+                best_score = score
+                best_pair_count = pair_count
+
+    if best_subset is None:
+        return pd.DataFrame(columns=ready_universe.columns)
+
+    return best_subset.drop(columns=["_actual_gross_notional", "_base_portfolio_weight"], errors="ignore").reset_index(drop=True)
+
+
 def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, config: AlpacaConfig) -> pd.DataFrame:
     """Convert pair allocations into per-symbol target share counts."""
-    if ready_universe.empty:
+    executable_universe = build_executable_ready_universe(ready_universe, deployable_capital, config)
+    if executable_universe.empty:
         return pd.DataFrame()
 
     leg_rows: List[Dict[str, object]] = []
 
-    for _, row in ready_universe.iterrows():
+    for _, row in executable_universe.iterrows():
         action = str(row.get("current_action", "")).strip()
         sizing = calculate_pair_sizing(row, deployable_capital, config)
         if sizing is None:
@@ -497,12 +601,13 @@ def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, c
 
 def build_pair_trade_plan(ready_universe: pd.DataFrame, deployable_capital: float, config: AlpacaConfig) -> pd.DataFrame:
     """Build a clear per-pair trade plan for actionable live signals."""
-    if ready_universe.empty:
+    executable_universe = build_executable_ready_universe(ready_universe, deployable_capital, config)
+    if executable_universe.empty:
         return pd.DataFrame()
 
     plan_rows: List[Dict[str, object]] = []
 
-    for _, row in ready_universe.iterrows():
+    for _, row in executable_universe.iterrows():
         action = str(row.get("current_action", "")).strip()
         sizing = calculate_pair_sizing(row, deployable_capital, config)
         if sizing is None:
@@ -670,52 +775,83 @@ def execute_orders(client: AlpacaClient, preview_df: pd.DataFrame, signal_date: 
             source_pairs=source_pairs,
         )
         try:
-            response = client.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side=side,
-                client_order_id=client_order_id,
-            )
-            execution_rows.append(
-                {
-                    "submitted_at": datetime.now().isoformat(timespec="seconds"),
-                    "symbol": symbol,
-                    "side": side,
-                    "order_qty": qty,
-                    "target_qty": target_qty,
-                    "current_qty": int(row["current_qty"]),
-                    "alpaca_order_id": response.get("id", ""),
-                    "client_order_id": client_order_id,
-                    "alpaca_status": response.get("status", ""),
-                    "filled_qty": safe_float(response.get("filled_qty")),
-                    "filled_avg_price": safe_float(response.get("filled_avg_price")),
-                    "created_at": response.get("created_at", ""),
-                    "updated_at": response.get("updated_at", ""),
-                    "source_pairs": source_pairs,
-                    "error": "",
-                }
-            )
+            retried_client_order_id = ""
+            response = client.submit_order(symbol=symbol, qty=qty, side=side, client_order_id=client_order_id)
         except requests.HTTPError as exc:
-            execution_rows.append(
-                {
-                    "submitted_at": datetime.now().isoformat(timespec="seconds"),
-                    "symbol": symbol,
-                    "side": side,
-                    "order_qty": qty,
-                    "target_qty": target_qty,
-                    "current_qty": int(row["current_qty"]),
-                    "alpaca_order_id": "",
-                    "client_order_id": client_order_id,
-                    "alpaca_status": "rejected",
-                    "filled_qty": float("nan"),
-                    "filled_avg_price": float("nan"),
-                    "created_at": "",
-                    "updated_at": "",
-                    "source_pairs": source_pairs,
-                    "error": str(exc),
-                }
-            )
-            print(f"Order rejected for {symbol} {side} {qty}: {exc}")
+            error_text = str(exc)
+            if "client_order_id must be unique" not in error_text:
+                execution_rows.append(
+                    {
+                        "submitted_at": datetime.now().isoformat(timespec="seconds"),
+                        "symbol": symbol,
+                        "side": side,
+                        "order_qty": qty,
+                        "target_qty": target_qty,
+                        "current_qty": int(row["current_qty"]),
+                        "alpaca_order_id": "",
+                        "client_order_id": client_order_id,
+                        "retried_client_order_id": "",
+                        "alpaca_status": "rejected",
+                        "filled_qty": float("nan"),
+                        "filled_avg_price": float("nan"),
+                        "created_at": "",
+                        "updated_at": "",
+                        "source_pairs": source_pairs,
+                        "error": error_text,
+                    }
+                )
+                print(f"Order rejected for {symbol} {side} {qty}: {exc}")
+                continue
+
+            retry_client_order_id = build_retry_client_order_id(client_order_id)
+            try:
+                response = client.submit_order(symbol=symbol, qty=qty, side=side, client_order_id=retry_client_order_id)
+                client_order_id = retry_client_order_id
+                retried_client_order_id = retry_client_order_id
+            except requests.HTTPError as retry_exc:
+                execution_rows.append(
+                    {
+                        "submitted_at": datetime.now().isoformat(timespec="seconds"),
+                        "symbol": symbol,
+                        "side": side,
+                        "order_qty": qty,
+                        "target_qty": target_qty,
+                        "current_qty": int(row["current_qty"]),
+                        "alpaca_order_id": "",
+                        "client_order_id": client_order_id,
+                        "retried_client_order_id": retry_client_order_id,
+                        "alpaca_status": "rejected",
+                        "filled_qty": float("nan"),
+                        "filled_avg_price": float("nan"),
+                        "created_at": "",
+                        "updated_at": "",
+                        "source_pairs": source_pairs,
+                        "error": str(retry_exc),
+                    }
+                )
+                print(f"Order rejected for {symbol} {side} {qty}: {retry_exc}")
+                continue
+
+        execution_rows.append(
+            {
+                "submitted_at": datetime.now().isoformat(timespec="seconds"),
+                "symbol": symbol,
+                "side": side,
+                "order_qty": qty,
+                "target_qty": target_qty,
+                "current_qty": int(row["current_qty"]),
+                "alpaca_order_id": response.get("id", ""),
+                "client_order_id": client_order_id,
+                "retried_client_order_id": retried_client_order_id,
+                "alpaca_status": response.get("status", ""),
+                "filled_qty": safe_float(response.get("filled_qty")),
+                "filled_avg_price": safe_float(response.get("filled_avg_price")),
+                "created_at": response.get("created_at", ""),
+                "updated_at": response.get("updated_at", ""),
+                "source_pairs": source_pairs,
+                "error": "",
+            }
+        )
 
     return pd.DataFrame(execution_rows)
 
@@ -832,6 +968,131 @@ def build_pair_risk_rows(
     return pd.DataFrame(risk_rows)
 
 
+def estimate_active_cycle_start(
+    pair: str,
+    action: str,
+    current_position: float,
+    lifecycle_log: pd.DataFrame,
+    as_of: pd.Timestamp,
+) -> pd.Timestamp:
+    """Estimate when the currently active pair cycle began from lifecycle history."""
+    if not np.isfinite(current_position) or int(current_position) == 0:
+        return pd.NaT
+    if action not in {"LONG_SPREAD", "SHORT_SPREAD"}:
+        return pd.NaT
+    if lifecycle_log.empty or "pair" not in lifecycle_log.columns:
+        return as_of
+
+    history = lifecycle_log[lifecycle_log["pair"].astype(str) == str(pair)].copy()
+    if history.empty:
+        return as_of
+    if "captured_at" not in history.columns or "current_action" not in history.columns:
+        return as_of
+
+    history["captured_at"] = pd.to_datetime(history["captured_at"], errors="coerce")
+    history["current_position"] = pd.to_numeric(history.get("current_position"), errors="coerce")
+    history = history.dropna(subset=["captured_at"]).sort_values("captured_at")
+
+    cycle_start = as_of
+    for _, prior in history.iloc[::-1].iterrows():
+        prior_position = safe_float(prior.get("current_position"))
+        prior_action = str(prior.get("current_action", "")).strip()
+        if not np.isfinite(prior_position) or int(prior_position) == 0:
+            break
+        if prior_action != action:
+            break
+        cycle_start = prior["captured_at"]
+
+    return cycle_start
+
+
+def build_live_pair_risk_rows(
+    live_universe: pd.DataFrame,
+    attribution_df: pd.DataFrame,
+    lifecycle_log: pd.DataFrame,
+    account_equity: float,
+    config: AlpacaConfig,
+) -> pd.DataFrame:
+    """Detect stop-loss and stale-trade time-stop breaches for currently held pairs."""
+    if live_universe.empty or attribution_df.empty or not np.isfinite(account_equity) or account_equity <= 0:
+        return pd.DataFrame()
+
+    live_map = live_universe.set_index("pair", drop=False).to_dict("index")
+    captured_at = pd.Timestamp.now()
+    stop_threshold = -account_equity * config.pair_stop_loss_fraction
+    risk_rows: List[Dict[str, object]] = []
+
+    for _, row in attribution_df.iterrows():
+        pair = str(row.get("pair", "")).strip()
+        if not pair or pair not in live_map:
+            continue
+
+        live_row = live_map[pair]
+        latest_date = str(live_row.get("latest_date", row.get("latest_date", "")))
+        pair_pnl = safe_float(row.get("pair_unrealized_pl"))
+        if np.isfinite(pair_pnl) and config.pair_stop_loss_fraction > 0 and pair_pnl <= stop_threshold:
+            risk_rows.append(
+                {
+                    "event_at": captured_at.isoformat(timespec="seconds"),
+                    "latest_date": latest_date,
+                    "pair": pair,
+                    "event_type": "STOP_LOSS",
+                    "event_value": pair_pnl,
+                    "threshold_value": stop_threshold,
+                    "notes": f"Live pair PnL {pair_pnl:.2f} breached stop-loss threshold {stop_threshold:.2f}.",
+                }
+            )
+
+        if config.time_stop_half_lives <= 0 and config.time_stop_min_days <= 0:
+            continue
+
+        action = str(live_row.get("current_action", "")).strip()
+        current_position = safe_float(live_row.get("current_position"))
+        cycle_start = estimate_active_cycle_start(
+            pair=pair,
+            action=action,
+            current_position=current_position,
+            lifecycle_log=lifecycle_log,
+            as_of=captured_at,
+        )
+        if pd.isna(cycle_start):
+            continue
+
+        hold_days = max((captured_at.date() - cycle_start.date()).days, 0)
+        live_half_life = safe_float(live_row.get("live_half_life"))
+        time_stop_days = config.time_stop_min_days
+        if np.isfinite(live_half_life) and live_half_life > 0 and config.time_stop_half_lives > 0:
+            time_stop_days = max(time_stop_days, int(np.ceil(live_half_life * config.time_stop_half_lives)))
+        if time_stop_days <= 0:
+            continue
+        if hold_days < time_stop_days:
+            continue
+        if not np.isfinite(pair_pnl) or pair_pnl > 0:
+            continue
+
+        risk_rows.append(
+            {
+                "event_at": captured_at.isoformat(timespec="seconds"),
+                "latest_date": latest_date,
+                "pair": pair,
+                "event_type": "TIME_STOP",
+                "event_value": hold_days,
+                "threshold_value": time_stop_days,
+                "notes": (
+                    f"Held {hold_days} days with pair PnL {pair_pnl:.2f}; "
+                    f"time-stop threshold is {time_stop_days} days."
+                ),
+            }
+        )
+
+    if not risk_rows:
+        return pd.DataFrame()
+
+    risk_df = pd.DataFrame(risk_rows)
+    risk_df = risk_df.drop_duplicates(subset=["latest_date", "pair", "event_type"], keep="last")
+    return risk_df
+
+
 def upsert_risk_rows(path: Path, new_rows: pd.DataFrame) -> None:
     """Append risk rows while replacing duplicate pair/date/event entries."""
     if new_rows.empty:
@@ -851,22 +1112,35 @@ def load_pair_risk_rows(path: Path) -> pd.DataFrame:
     return load_csv(path)
 
 
-def get_pairs_in_cooldown(ready_universe: pd.DataFrame, risk_rows: pd.DataFrame) -> Set[str]:
-    """Block re-entry for pairs stopped earlier in the same signal cycle."""
+def get_pairs_in_cooldown(ready_universe: pd.DataFrame, risk_rows: pd.DataFrame, cooldown_days: int = 0) -> Set[str]:
+    """Block re-entry for pairs stopped in the same or a recent signal cycle."""
     if ready_universe.empty or risk_rows.empty:
         return set()
+
+    normalized_risk = risk_rows.copy()
+    normalized_risk["pair"] = normalized_risk.get("pair", "").astype(str)
+    normalized_risk["latest_date"] = pd.to_datetime(normalized_risk.get("latest_date"), errors="coerce")
+    normalized_risk["event_type"] = normalized_risk.get("event_type", "").astype(str)
+    normalized_risk = normalized_risk[normalized_risk["event_type"].isin({"STOP_LOSS", "TIME_STOP"})]
 
     cooldown_pairs: Set[str] = set()
     for _, row in ready_universe.iterrows():
         pair = str(row.get("pair", ""))
-        latest_date = str(row.get("latest_date", ""))
-        matches = risk_rows[
-            (risk_rows["pair"].astype(str) == pair)
-            & (risk_rows["latest_date"].astype(str) == latest_date)
-            & (risk_rows["event_type"].astype(str) == "STOP_LOSS")
-        ]
+        latest_date = pd.to_datetime(row.get("latest_date"), errors="coerce")
+        if not pair or pd.isna(latest_date):
+            continue
+
+        matches = normalized_risk[normalized_risk["pair"] == pair].dropna(subset=["latest_date"])
         if not matches.empty:
-            cooldown_pairs.add(pair)
+            same_cycle = matches["latest_date"].dt.date == latest_date.date()
+            if bool(same_cycle.any()):
+                cooldown_pairs.add(pair)
+                continue
+
+            if cooldown_days > 0:
+                recent_days = (latest_date.normalize() - matches["latest_date"].dt.normalize()).dt.days
+                if bool(((recent_days >= 0) & (recent_days <= cooldown_days)).any()):
+                    cooldown_pairs.add(pair)
 
     return cooldown_pairs
 
@@ -1014,6 +1288,15 @@ def get_flatten_symbols_from_live_universe(live_universe: pd.DataFrame, blocked_
             [
                 flatten_rows,
                 live_universe[live_universe["pair"].astype(str).isin(blocked_pairs)],
+            ],
+            ignore_index=True,
+        )
+
+    if "live_recommendation" in live_universe.columns:
+        flatten_rows = pd.concat(
+            [
+                flatten_rows,
+                live_universe[live_universe["live_recommendation"].astype(str) == "QUALIFIED_BUT_BLOCKED"],
             ],
             ignore_index=True,
         )
@@ -1297,6 +1580,104 @@ def build_live_pair_attribution_rows(live_universe: pd.DataFrame, positions: Lis
     return pd.DataFrame(rows)
 
 
+def build_pair_roundtrip_rows(
+    lifecycle_log: pd.DataFrame,
+    attribution_log: pd.DataFrame,
+    risk_rows: pd.DataFrame,
+    existing_roundtrips: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Summarize closed pair cycles into one row per round-trip trade."""
+    if lifecycle_log.empty or attribution_log.empty:
+        return pd.DataFrame()
+
+    lifecycle = lifecycle_log.copy()
+    attribution = attribution_log.copy()
+    lifecycle["captured_at"] = pd.to_datetime(lifecycle["captured_at"], errors="coerce")
+    attribution["captured_at"] = pd.to_datetime(attribution["captured_at"], errors="coerce")
+    lifecycle["current_position"] = pd.to_numeric(lifecycle.get("current_position"), errors="coerce")
+    lifecycle = lifecycle.dropna(subset=["captured_at"]).sort_values(["pair", "captured_at"])
+    attribution = attribution.dropna(subset=["captured_at"]).sort_values(["pair", "captured_at"])
+
+    existing_ids: Set[str] = set()
+    if existing_roundtrips is not None and not existing_roundtrips.empty and "cycle_id" in existing_roundtrips.columns:
+        existing_ids = set(existing_roundtrips["cycle_id"].astype(str))
+
+    risk_lookup: Dict[tuple, str] = {}
+    if not risk_rows.empty and {"pair", "latest_date", "event_type"}.issubset(risk_rows.columns):
+        for _, risk in risk_rows.iterrows():
+            risk_lookup[(str(risk.get("pair", "")), str(risk.get("latest_date", "")))] = str(risk.get("event_type", ""))
+
+    roundtrip_rows: List[Dict[str, object]] = []
+    for pair, pair_lifecycle in lifecycle.groupby("pair", sort=True):
+        active_cycle: Optional[Dict[str, object]] = None
+        for _, row in pair_lifecycle.iterrows():
+            action = str(row.get("current_action", "")).strip()
+            current_position = safe_float(row.get("current_position"))
+            is_active = np.isfinite(current_position) and int(current_position) != 0 and action in {"LONG_SPREAD", "SHORT_SPREAD"}
+
+            if active_cycle is None:
+                if is_active:
+                    active_cycle = row.to_dict()
+                continue
+
+            same_cycle = is_active and str(active_cycle.get("current_action", "")) == action
+            if same_cycle:
+                continue
+
+            entry_at = parse_timestamp(active_cycle.get("captured_at"))
+            exit_at = parse_timestamp(row.get("captured_at"))
+            cycle_id = hashlib.sha1(f"{pair}|{entry_at.isoformat()}|{active_cycle.get('current_action','')}".encode("utf-8")).hexdigest()[:16]
+            if cycle_id not in existing_ids and pd.notna(entry_at) and pd.notna(exit_at) and exit_at > entry_at:
+                cycle_attr = attribution[
+                    (attribution["pair"].astype(str) == str(pair))
+                    & (attribution["captured_at"] >= entry_at)
+                    & (attribution["captured_at"] <= exit_at)
+                ].copy()
+                if not cycle_attr.empty:
+                    first_attr = cycle_attr.iloc[0]
+                    last_attr = cycle_attr.iloc[-1]
+                    long_exit_pl = safe_float(last_attr.get("long_unrealized_pl"))
+                    short_exit_pl = safe_float(last_attr.get("short_unrealized_pl"))
+                    pair_exit_pl = safe_float(last_attr.get("pair_unrealized_pl"))
+                    both_positive_exit = np.isfinite(long_exit_pl) and np.isfinite(short_exit_pl) and long_exit_pl > 0 and short_exit_pl > 0
+                    both_negative_exit = np.isfinite(long_exit_pl) and np.isfinite(short_exit_pl) and long_exit_pl < 0 and short_exit_pl < 0
+                    split_sign_exit = np.isfinite(long_exit_pl) and np.isfinite(short_exit_pl) and ((long_exit_pl > 0 > short_exit_pl) or (short_exit_pl > 0 > long_exit_pl))
+                    exit_signal_date = str(row.get("latest_date", ""))
+                    roundtrip_rows.append(
+                        {
+                            "cycle_id": cycle_id,
+                            "pair": pair,
+                            "action": str(active_cycle.get("current_action", "")),
+                            "entry_at": entry_at.isoformat(),
+                            "exit_at": exit_at.isoformat(),
+                            "entry_signal_date": str(active_cycle.get("latest_date", "")),
+                            "exit_signal_date": exit_signal_date,
+                            "hold_days": max((exit_at.date() - entry_at.date()).days, 0),
+                            "entry_live_zscore": safe_float(active_cycle.get("live_zscore")),
+                            "exit_live_zscore": safe_float(row.get("live_zscore")),
+                            "entry_live_beta": safe_float(active_cycle.get("live_beta")),
+                            "entry_live_half_life": safe_float(active_cycle.get("live_half_life")),
+                            "entry_portfolio_weight": safe_float(active_cycle.get("portfolio_weight")),
+                            "long_symbol": str(first_attr.get("long_symbol", "")),
+                            "short_symbol": str(first_attr.get("short_symbol", "")),
+                            "max_favorable_excursion": pd.to_numeric(cycle_attr["pair_unrealized_pl"], errors="coerce").max(),
+                            "max_adverse_excursion": pd.to_numeric(cycle_attr["pair_unrealized_pl"], errors="coerce").min(),
+                            "exit_long_unrealized_pl": long_exit_pl,
+                            "exit_short_unrealized_pl": short_exit_pl,
+                            "exit_pair_unrealized_pl": pair_exit_pl,
+                            "both_legs_positive_at_exit": both_positive_exit,
+                            "both_legs_negative_at_exit": both_negative_exit,
+                            "split_sign_at_exit": split_sign_exit,
+                            "both_legs_positive_rate": float(((pd.to_numeric(cycle_attr["long_unrealized_pl"], errors="coerce") > 0) & (pd.to_numeric(cycle_attr["short_unrealized_pl"], errors="coerce") > 0)).mean()),
+                            "exit_reason": risk_lookup.get((pair, exit_signal_date), str(row.get("execution_state", ""))),
+                        }
+                    )
+
+            active_cycle = row.to_dict() if is_active else None
+
+    return pd.DataFrame(roundtrip_rows)
+
+
 def append_csv_rows(path: Path, rows: pd.DataFrame) -> None:
     """Append rows to a CSV log, creating it if needed."""
     if rows.empty:
@@ -1360,9 +1741,13 @@ def main() -> None:
     if not np.isfinite(deployable_capital) or deployable_capital <= 0:
         raise ValueError("No deployable capital is available from equity/buying power constraints.")
 
+    attribution_df = build_live_pair_attribution_rows(live_universe, positions)
+    prior_lifecycle_log = load_csv(PAIR_LIFECYCLE_LOG_OUTPUT)
     initial_pair_trade_plan = build_pair_trade_plan(ready_universe, deployable_capital, config)
     position_details = build_position_details_map(positions)
-    new_risk_rows = build_pair_risk_rows(initial_pair_trade_plan, position_details, account_equity, config)
+    stop_loss_rows = build_pair_risk_rows(initial_pair_trade_plan, position_details, account_equity, config)
+    live_risk_rows = build_live_pair_risk_rows(live_universe, attribution_df, prior_lifecycle_log, account_equity, config)
+    new_risk_rows = pd.concat([stop_loss_rows, live_risk_rows], ignore_index=True) if not stop_loss_rows.empty or not live_risk_rows.empty else pd.DataFrame()
     if not new_risk_rows.empty:
         upsert_risk_rows(PAIR_RISK_EVENTS_LOG_OUTPUT, new_risk_rows)
     risk_rows = load_pair_risk_rows(PAIR_RISK_EVENTS_LOG_OUTPUT)
@@ -1370,7 +1755,7 @@ def main() -> None:
 
     blocked_pairs = set(config.pair_denylist)
     if not ready_universe.empty:
-        blocked_pairs.update(get_pairs_in_cooldown(ready_universe, risk_rows))
+        blocked_pairs.update(get_pairs_in_cooldown(ready_universe, risk_rows, cooldown_days=config.reentry_cooldown_days))
     already_submitted_pairs = get_pairs_already_submitted_this_cycle(ready_universe, prior_trade_log)
     ready_universe = filter_blocked_pairs(ready_universe, blocked_pairs | already_submitted_pairs)
 
@@ -1379,12 +1764,19 @@ def main() -> None:
     pair_lifecycle_df = build_pair_lifecycle_rows(live_universe, pair_trade_plan)
     account_snapshot_df = build_account_snapshot_rows(account, deployable_capital)
     positions_snapshot_df = build_positions_snapshot_rows(positions)
-    attribution_df = build_live_pair_attribution_rows(live_universe, positions)
 
     append_csv_rows(ACCOUNT_SNAPSHOT_LOG_OUTPUT, account_snapshot_df)
     append_csv_rows(POSITIONS_SNAPSHOT_LOG_OUTPUT, positions_snapshot_df)
     append_csv_rows(PAIR_LIFECYCLE_LOG_OUTPUT, pair_lifecycle_df)
+    append_csv_rows(PAIR_ATTRIBUTION_LOG_OUTPUT, attribution_df)
     attribution_df.to_csv(PAIR_ATTRIBUTION_OUTPUT, index=False)
+    roundtrip_rows = build_pair_roundtrip_rows(
+        lifecycle_log=load_csv(PAIR_LIFECYCLE_LOG_OUTPUT),
+        attribution_log=load_csv(PAIR_ATTRIBUTION_LOG_OUTPUT),
+        risk_rows=risk_rows,
+        existing_roundtrips=load_csv(PAIR_ROUNDTRIP_LOG_OUTPUT),
+    )
+    append_csv_rows(PAIR_ROUNDTRIP_LOG_OUTPUT, roundtrip_rows)
 
     all_managed_symbols = sorted(extract_pair_symbols(live_universe))
     flatten_symbols = get_flatten_symbols_from_live_universe(live_universe, blocked_pairs)
@@ -1406,6 +1798,8 @@ def main() -> None:
     print(f"Deployable capital: ${deployable_capital:,.2f}")
     print(f"Preview saved to: {ORDER_PREVIEW_OUTPUT.resolve()}")
     print(f"Pair attribution saved to: {PAIR_ATTRIBUTION_OUTPUT.resolve()}")
+    if not roundtrip_rows.empty:
+        print(f"Pair round-trip log updated: {PAIR_ROUNDTRIP_LOG_OUTPUT.resolve()}")
     if flatten_symbols:
         print(f"Symbols marked for flatten-if-held: {', '.join(sorted(flatten_symbols))}")
     if blocked_pairs:

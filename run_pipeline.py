@@ -2,7 +2,7 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 PAIR_CHECKER_SCRIPT = Path("pair_checker.py")
@@ -19,7 +19,8 @@ def run_step(command: List[str], label: str) -> None:
         raise SystemExit(result.returncode)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser so other entrypoints can reuse it."""
     parser = argparse.ArgumentParser(description="Run the pair trading research and execution pipeline.")
     parser.add_argument(
         "--skip-research",
@@ -46,7 +47,12 @@ def main() -> None:
         action="store_true",
         help="Pass --allow-stale to alpaca_paper_trading.py.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     python_executable = sys.executable
 

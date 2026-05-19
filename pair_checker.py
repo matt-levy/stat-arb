@@ -57,6 +57,8 @@ MIN_ROWS_PER_PAIR = TRAINING_WINDOW_DAYS + TEST_WINDOW_DAYS
 TOP_N_PRINT = 20
 TOP_N_PLOTS = 5
 LIVE_SIGNAL_TOP_N = 10
+PLOT_PRE_ENTRY_BARS = 20
+PLOT_FALLBACK_BARS = 90
 
 RANKED_OUTPUT_CSV = OUTPUTS_DIR / "ranked_pairs_walk_forward.csv"
 FAILED_OUTPUT_CSV = OUTPUTS_DIR / "failed_pairs_diagnostics.csv"
@@ -86,6 +88,7 @@ LIVE_BORDERLINE_CONFIDENCE_MIN = 8.0
 LIVE_BORDERLINE_ROBUSTNESS_MIN = 8.0
 LIVE_BORDERLINE_SIZE_MULTIPLIER = 0.50
 LIVE_BORDERLINE_MAX_DEGRADATION_SCORE = 2.5
+LIVE_LEG_DOMINANCE_SIZE_MULTIPLIER = 0.50
 EVENT_CALENDAR_CSV = DATA_DIR / "earnings_events.csv"
 EVENT_POST_COOLDOWN_BUSINESS_DAYS = 3
 EVENT_PRE_BLOCK_BUSINESS_DAYS = 1
@@ -1402,19 +1405,42 @@ def clear_plot_dir(plot_dir: Path) -> None:
         png_file.unlink(missing_ok=True)
 
 
+def determine_plot_window(
+    position: pd.Series,
+    pre_entry_bars: int = PLOT_PRE_ENTRY_BARS,
+    fallback_bars: int = PLOT_FALLBACK_BARS,
+) -> Tuple[pd.Index, Optional[pd.Timestamp]]:
+    """Return the visible index slice and entry timestamp for the current trade cycle."""
+    if position.empty:
+        return position.index, None
+
+    clean_position = pd.to_numeric(position, errors="coerce").fillna(0.0)
+    current_position = safe_float(clean_position.iloc[-1])
+    if not np.isfinite(current_position) or current_position == 0.0:
+        start_idx = max(0, len(clean_position) - fallback_bars)
+        return clean_position.index[start_idx:], None
+
+    entry_idx = len(clean_position) - 1
+    while entry_idx > 0 and safe_float(clean_position.iloc[entry_idx - 1]) == current_position:
+        entry_idx -= 1
+
+    plot_start_idx = max(0, entry_idx - pre_entry_bars)
+    entry_timestamp = pd.Timestamp(clean_position.index[entry_idx])
+    return clean_position.index[plot_start_idx:], entry_timestamp
+
+
 def plot_pair_diagnostics(
-    ranked_df: pd.DataFrame,
+    selected_pairs_df: pd.DataFrame,
     prices: pd.DataFrame,
-    top_n: int,
     plot_dir: Path,
 ) -> None:
-    """Save spread, z-score, and price plots for the top-ranked pairs."""
-    if ranked_df.empty or prices.empty:
+    """Save spread, z-score, and price plots for the selected pairs."""
+    if selected_pairs_df.empty or prices.empty:
         return
 
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    for _, row in ranked_df.head(top_n).iterrows():
+    for _, row in selected_pairs_df.iterrows():
         stock_x = row["stock_x"]
         stock_y = row["stock_y"]
         beta = row["latest_beta"]
@@ -1427,15 +1453,23 @@ def plot_pair_diagnostics(
         log_y = np.log(pair_prices[stock_y])
         spread = compute_spread(log_x, log_y, beta)
         zscore = compute_zscore(spread, Z_WINDOW)
+        position = build_positions(zscore, entry_z=ENTRY_Z, exit_z=EXIT_Z)
+        plot_index, entry_timestamp = determine_plot_window(position)
+
+        plot_spread = spread.loc[plot_index]
+        plot_zscore = zscore.loc[plot_index]
+        plot_pair_prices = pair_prices.loc[plot_index]
+        if plot_spread.empty or plot_zscore.empty or plot_pair_prices.empty:
+            continue
 
         figure, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
 
-        axes[0].plot(spread.index, spread.values, color="navy", linewidth=1.2)
+        axes[0].plot(plot_spread.index, plot_spread.values, color="navy", linewidth=1.2)
         axes[0].set_title(f"{row['pair']} Spread")
         axes[0].set_ylabel("Spread")
         axes[0].grid(alpha=0.3)
 
-        axes[1].plot(zscore.index, zscore.values, color="darkgreen", linewidth=1.2)
+        axes[1].plot(plot_zscore.index, plot_zscore.values, color="darkgreen", linewidth=1.2)
         axes[1].axhline(ENTRY_Z, color="firebrick", linestyle="--", linewidth=1.0, label="Entry")
         axes[1].axhline(-ENTRY_Z, color="firebrick", linestyle="--", linewidth=1.0)
         axes[1].axhline(EXIT_Z, color="gray", linestyle=":", linewidth=1.0, label="Exit")
@@ -1445,7 +1479,7 @@ def plot_pair_diagnostics(
         axes[1].grid(alpha=0.3)
         axes[1].legend(loc="upper left")
 
-        normalized_prices = pair_prices / pair_prices.iloc[0]
+        normalized_prices = plot_pair_prices / plot_pair_prices.iloc[0]
         axes[2].plot(normalized_prices.index, normalized_prices[stock_x], label=stock_x, linewidth=1.2)
         axes[2].plot(normalized_prices.index, normalized_prices[stock_y], label=stock_y, linewidth=1.2)
         axes[2].set_title(f"{row['pair']} Normalized Prices")
@@ -1453,10 +1487,44 @@ def plot_pair_diagnostics(
         axes[2].grid(alpha=0.3)
         axes[2].legend(loc="upper left")
 
+        if entry_timestamp is not None:
+            for axis in axes:
+                axis.axvline(
+                    entry_timestamp,
+                    color="darkorange",
+                    linestyle="--",
+                    linewidth=1.0,
+                    alpha=0.9,
+                )
+
         figure.tight_layout()
         output_path = plot_dir / f"{sanitize_filename(row['pair'])}.png"
         figure.savefig(output_path, dpi=150, bbox_inches="tight")
         plt.close(figure)
+
+
+def select_pairs_for_plotting(ranked_df: pd.DataFrame, live_signals_df: pd.DataFrame) -> pd.DataFrame:
+    """Return ranked-pair rows for currently active live positions only."""
+    if ranked_df.empty or live_signals_df.empty or "pair" not in live_signals_df.columns:
+        return pd.DataFrame(columns=ranked_df.columns)
+
+    active_live_pairs = live_signals_df.copy()
+    if "current_position" not in active_live_pairs.columns:
+        return pd.DataFrame(columns=ranked_df.columns)
+
+    active_live_pairs["current_position"] = pd.to_numeric(active_live_pairs["current_position"], errors="coerce").fillna(0.0)
+    active_pair_names = active_live_pairs.loc[active_live_pairs["current_position"] != 0, "pair"].astype(str)
+    if active_pair_names.empty:
+        return pd.DataFrame(columns=ranked_df.columns)
+
+    active_pair_order = active_pair_names.drop_duplicates().tolist()
+    selected = ranked_df[ranked_df["pair"].astype(str).isin(active_pair_order)].copy()
+    if selected.empty:
+        return pd.DataFrame(columns=ranked_df.columns)
+
+    selected["plot_order"] = selected["pair"].astype(str).map({pair_name: idx for idx, pair_name in enumerate(active_pair_order)})
+    selected = selected.sort_values("plot_order").drop(columns=["plot_order"]).reset_index(drop=True)
+    return selected
 
 
 def latest_live_signal_action(current_position: float, latest_zscore: float, entry_z: float) -> str:
@@ -1481,11 +1549,12 @@ def determine_operational_action(
     live_stability_reason: str = "",
     live_degradation_score: float = np.nan,
     passes_leg_contribution: bool = True,
+    leg_contribution_reason: str = "",
 ) -> str:
     """Convert research quality and current live context into an operational label.
 
-    Leg-contribution metrics are diagnostic only. They are accepted here so callers can pass
-    the full live context without changing recommendation behavior.
+    Active spread signals must pass both live-stability and leg-contribution checks before
+    they are considered executable.
     """
     actionable_signal = live_action in {"LONG_SPREAD", "SHORT_SPREAD"}
     watch_signal = live_action in {"WATCH_LONG", "WATCH_SHORT", "FLAT"}
@@ -1503,11 +1572,16 @@ def determine_operational_action(
         live_stability_reason=live_stability_reason,
         live_degradation_score=live_degradation_score,
     )
+    leg_multiplier = leg_contribution_size_multiplier(
+        passes_leg_contribution=passes_leg_contribution,
+        leg_contribution_reason=leg_contribution_reason,
+    )
 
     if (
         research_ready
         and stability_tier in {"PASS", "BORDERLINE"}
         and actionable_signal
+        and leg_multiplier > 0
     ):
         return "ELIGIBLE"
 
@@ -1563,6 +1637,22 @@ def live_stability_size_multiplier(stability_tier: str) -> float:
         return LIVE_BORDERLINE_SIZE_MULTIPLIER
     if stability_tier == "PASS":
         return 1.0
+    return 0.0
+
+
+def leg_contribution_size_multiplier(
+    passes_leg_contribution: bool,
+    leg_contribution_reason: str = "",
+) -> float:
+    """Map recent leg-balance diagnostics into a bounded sizing multiplier."""
+    if passes_leg_contribution:
+        return 1.0
+
+    reasons = {reason.strip() for reason in str(leg_contribution_reason).split("|") if reason.strip()}
+    if not reasons:
+        return 0.0
+    if "ONE_LEG_DOMINANCE" in reasons and "EXTREME_ONE_LEG_DOMINANCE" not in reasons:
+        return LIVE_LEG_DOMINANCE_SIZE_MULTIPLIER
     return 0.0
 
 
@@ -1858,6 +1948,18 @@ def build_live_signal_row(
         beta,
         corr_mean=safe_float(live_stability["recent_corr_mean"]),
     )
+    stability_tier = determine_live_stability_tier(
+        confidence_score=safe_float(pair_row["confidence_score"]),
+        robustness_score=safe_float(pair_row["robustness_score"]),
+        passes_live_stability=bool(live_stability["passes_live_stability"]),
+        live_stability_reason=str(live_stability["live_stability_reason"]),
+        live_degradation_score=safe_float(live_stability["live_degradation_score"]),
+    )
+    stability_multiplier = live_stability_size_multiplier(stability_tier)
+    leg_multiplier = leg_contribution_size_multiplier(
+        passes_leg_contribution=bool(leg_contribution["passes_leg_contribution"]),
+        leg_contribution_reason=str(leg_contribution["leg_contribution_reason"]),
+    )
 
     latest_date = live_df.index[-1]
     latest_zscore = safe_float(zscore.iloc[-1]) if not zscore.empty else np.nan
@@ -1868,13 +1970,6 @@ def build_live_signal_row(
         stock_y,
         latest_date,
         event_calendar if event_calendar is not None else pd.DataFrame(),
-    )
-    stability_tier = determine_live_stability_tier(
-        confidence_score=safe_float(pair_row["confidence_score"]),
-        robustness_score=safe_float(pair_row["robustness_score"]),
-        passes_live_stability=bool(live_stability["passes_live_stability"]),
-        live_stability_reason=str(live_stability["live_stability_reason"]),
-        live_degradation_score=safe_float(live_stability["live_degradation_score"]),
     )
 
     return {
@@ -1896,12 +1991,13 @@ def build_live_signal_row(
             live_stability_reason=str(live_stability["live_stability_reason"]),
             live_degradation_score=safe_float(live_stability["live_degradation_score"]),
             passes_leg_contribution=bool(leg_contribution["passes_leg_contribution"]),
+            leg_contribution_reason=str(leg_contribution["leg_contribution_reason"]),
         ),
         "passes_live_stability": bool(live_stability["passes_live_stability"]),
         "live_stability_reason": str(live_stability["live_stability_reason"]),
         "live_degradation_score": safe_float(live_stability["live_degradation_score"]),
         "live_stability_tier": stability_tier,
-        "live_size_multiplier": live_stability_size_multiplier(stability_tier),
+        "live_size_multiplier": min(stability_multiplier, leg_multiplier),
         "passes_leg_contribution": bool(leg_contribution["passes_leg_contribution"]),
         "leg_contribution_reason": str(leg_contribution["leg_contribution_reason"]),
         "recent_x_contribution": safe_float(leg_contribution["recent_x_contribution"]),
@@ -2283,10 +2379,10 @@ def main() -> None:
         print(f"Plot folder: {output_paths['plots']}")
         return
 
+    plot_pairs = select_pairs_for_plotting(ranked_pairs, live_signals)
     plot_pair_diagnostics(
-        ranked_df=ranked_pairs,
+        selected_pairs_df=plot_pairs,
         prices=downloaded_prices,
-        top_n=TOP_N_PLOTS,
         plot_dir=PLOT_DIR,
     )
 
