@@ -4,6 +4,9 @@ from unittest.mock import patch
 import pandas as pd
 
 from pair_checker import (
+    compute_current_edge_to_exit_ratio,
+    compute_current_expected_edge,
+    estimate_round_trip_cost_buffer,
     compute_event_context,
     leg_contribution_size_multiplier,
     determine_plot_window,
@@ -23,6 +26,24 @@ from run_pipeline import main as run_pipeline_main
 
 
 class ReadySignalTests(unittest.TestCase):
+    def test_current_edge_to_exit_ratio_scales_with_current_zscore(self):
+        self.assertAlmostEqual(compute_current_edge_to_exit_ratio(1.75, 1.75, 0.0), 1.0)
+        self.assertAlmostEqual(compute_current_edge_to_exit_ratio(2.625, 1.75, 0.0), 1.5)
+
+    def test_current_expected_edge_applies_live_haircut(self):
+        edge = compute_current_expected_edge(
+            latest_zscore=2.625,
+            entry_z=1.75,
+            exit_z=0.0,
+            oos_return_per_trade=0.04,
+            size_multiplier=0.5,
+        )
+
+        self.assertAlmostEqual(edge, 0.03, places=6)
+
+    def test_estimated_round_trip_cost_buffer_matches_backtest_costs(self):
+        self.assertAlmostEqual(estimate_round_trip_cost_buffer(), 0.002, places=9)
+
     def test_unstable_active_research_ready_pair_is_qualified_but_blocked(self):
         recommendation = determine_operational_action(
             research_verdict="STRONG_CANDIDATE",
@@ -178,6 +199,10 @@ class ReadySignalTests(unittest.TestCase):
                     "live_zscore": 2.8,
                     "live_beta": 1.0,
                     "live_half_life": 10.0,
+                    "current_edge_to_exit_ratio": 1.6,
+                    "current_expected_edge": 0.028,
+                    "estimated_round_trip_cost": 0.002,
+                    "current_net_expected_edge": 0.026,
                     "passes_live_stability": True,
                     "live_stability_reason": "",
                     "live_degradation_score": 0.0,
@@ -207,6 +232,10 @@ class ReadySignalTests(unittest.TestCase):
                     "live_zscore": 1.5,
                     "live_beta": 0.45,
                     "live_half_life": 14.0,
+                    "current_edge_to_exit_ratio": 0.9,
+                    "current_expected_edge": 0.010,
+                    "estimated_round_trip_cost": 0.002,
+                    "current_net_expected_edge": 0.008,
                     "passes_live_stability": False,
                     "live_stability_reason": "UNSTABLE_BETA",
                     "live_degradation_score": 1.5,
@@ -236,6 +265,10 @@ class ReadySignalTests(unittest.TestCase):
                     "live_zscore": -1.2,
                     "live_beta": 1.4,
                     "live_half_life": 7.0,
+                    "current_edge_to_exit_ratio": 0.7,
+                    "current_expected_edge": 0.012,
+                    "estimated_round_trip_cost": 0.002,
+                    "current_net_expected_edge": 0.010,
                     "passes_live_stability": True,
                     "live_stability_reason": "",
                     "live_degradation_score": 0.0,
@@ -265,6 +298,10 @@ class ReadySignalTests(unittest.TestCase):
                     "live_zscore": 0.2,
                     "live_beta": 1.1,
                     "live_half_life": 9.0,
+                    "current_edge_to_exit_ratio": 0.1,
+                    "current_expected_edge": 0.001,
+                    "estimated_round_trip_cost": 0.002,
+                    "current_net_expected_edge": -0.001,
                     "passes_live_stability": True,
                     "live_stability_reason": "",
                     "live_degradation_score": 0.0,
@@ -394,6 +431,10 @@ class ReadySignalTests(unittest.TestCase):
                     "live_zscore": 2.0,
                     "live_beta": 0.2,
                     "live_half_life": 18.0,
+                    "current_edge_to_exit_ratio": 1.1,
+                    "current_expected_edge": 0.018,
+                    "estimated_round_trip_cost": 0.002,
+                    "current_net_expected_edge": 0.016,
                     "passes_live_stability": False,
                     "live_stability_reason": "LOW_RECENT_CORR|UNSTABLE_CORR",
                     "live_degradation_score": 1.4,
@@ -423,6 +464,10 @@ class ReadySignalTests(unittest.TestCase):
                     "live_zscore": -1.8,
                     "live_beta": 0.62,
                     "live_half_life": 17.0,
+                    "current_edge_to_exit_ratio": 1.03,
+                    "current_expected_edge": 0.011,
+                    "estimated_round_trip_cost": 0.002,
+                    "current_net_expected_edge": 0.009,
                     "passes_live_stability": False,
                     "live_stability_reason": "UNSTABLE_BETA",
                     "live_degradation_score": 0.6,

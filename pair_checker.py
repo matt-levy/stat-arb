@@ -1540,6 +1540,47 @@ def latest_live_signal_action(current_position: float, latest_zscore: float, ent
     return "FLAT"
 
 
+def compute_current_edge_to_exit_ratio(latest_zscore: float, entry_z: float, exit_z: float) -> float:
+    """Scale edge by how far the current signal sits beyond the mean-reversion exit point."""
+    if pd.isna(latest_zscore) or pd.isna(entry_z) or entry_z <= 0:
+        return 0.0
+
+    effective_exit = max(abs(exit_z), 0.0)
+    distance_to_exit = max(abs(latest_zscore) - effective_exit, 0.0)
+    baseline_distance = max(entry_z - effective_exit, 1e-9)
+    return safe_float(np.clip(distance_to_exit / baseline_distance, 0.0, 2.0))
+
+
+def compute_current_expected_edge(
+    *,
+    latest_zscore: float,
+    entry_z: float,
+    exit_z: float,
+    oos_return_per_trade: float,
+    size_multiplier: float,
+) -> float:
+    """Estimate expected edge for the current setup using today's stretch and live-quality haircuts."""
+    base_edge = safe_float(oos_return_per_trade)
+    if not np.isfinite(base_edge) or base_edge <= 0:
+        return 0.0
+
+    ratio = compute_current_edge_to_exit_ratio(latest_zscore, entry_z, exit_z)
+    live_multiplier = safe_float(size_multiplier)
+    if not np.isfinite(live_multiplier):
+        live_multiplier = 1.0
+    live_multiplier = float(np.clip(live_multiplier, 0.0, 1.0))
+    return safe_float(base_edge * ratio * live_multiplier)
+
+
+def estimate_round_trip_cost_buffer(
+    cost_per_turn: float = COST_PER_TURN,
+    slippage_per_turn: float = SLIPPAGE_PER_TURN,
+) -> float:
+    """Estimate a conservative round-trip trading-cost buffer in return units."""
+    per_turn_cost = max(safe_float(cost_per_turn), 0.0) + max(safe_float(slippage_per_turn), 0.0)
+    return safe_float(2.0 * per_turn_cost)
+
+
 def determine_operational_action(
     research_verdict: str,
     confidence_score: float,
@@ -1965,6 +2006,17 @@ def build_live_signal_row(
     latest_zscore = safe_float(zscore.iloc[-1]) if not zscore.empty else np.nan
     current_position = safe_float(position.iloc[-1]) if not position.empty else 0.0
     current_action = latest_live_signal_action(current_position, latest_zscore, entry_z)
+    live_size_multiplier = min(stability_multiplier, leg_multiplier)
+    current_edge_to_exit_ratio = compute_current_edge_to_exit_ratio(latest_zscore, entry_z, exit_z)
+    current_expected_edge = compute_current_expected_edge(
+        latest_zscore=latest_zscore,
+        entry_z=entry_z,
+        exit_z=exit_z,
+        oos_return_per_trade=safe_float(pair_row.get("oos_return_per_trade")),
+        size_multiplier=live_size_multiplier,
+    )
+    estimated_round_trip_cost = estimate_round_trip_cost_buffer()
+    current_net_expected_edge = safe_float(current_expected_edge - estimated_round_trip_cost)
     event_context = compute_event_context(
         stock_x,
         stock_y,
@@ -1982,6 +2034,10 @@ def build_live_signal_row(
         "live_spread": safe_float(spread.iloc[-1]),
         "current_position": int(current_position),
         "current_action": current_action,
+        "current_edge_to_exit_ratio": current_edge_to_exit_ratio,
+        "current_expected_edge": current_expected_edge,
+        "estimated_round_trip_cost": estimated_round_trip_cost,
+        "current_net_expected_edge": current_net_expected_edge,
         "live_recommendation": determine_operational_action(
             research_verdict=str(pair_row["research_verdict"]),
             confidence_score=safe_float(pair_row["confidence_score"]),
@@ -1997,7 +2053,7 @@ def build_live_signal_row(
         "live_stability_reason": str(live_stability["live_stability_reason"]),
         "live_degradation_score": safe_float(live_stability["live_degradation_score"]),
         "live_stability_tier": stability_tier,
-        "live_size_multiplier": min(stability_multiplier, leg_multiplier),
+        "live_size_multiplier": live_size_multiplier,
         "passes_leg_contribution": bool(leg_contribution["passes_leg_contribution"]),
         "leg_contribution_reason": str(leg_contribution["leg_contribution_reason"]),
         "recent_x_contribution": safe_float(leg_contribution["recent_x_contribution"]),

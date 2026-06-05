@@ -43,6 +43,10 @@ DEFAULT_NEAR_EXIT_NO_ADD_Z = 0.75
 DEFAULT_TIME_STOP_HALF_LIVES = 3.0
 DEFAULT_TIME_STOP_MIN_DAYS = 5
 DEFAULT_REENTRY_COOLDOWN_DAYS = 3
+DEFAULT_MIN_EXPECTED_EDGE = 0.0
+DEFAULT_MIN_REBALANCE_SHARES = 0
+DEFAULT_MIN_REBALANCE_NOTIONAL = 0.0
+DEFAULT_FAIL_ON_RECONCILE_MISMATCH = True
 REQUEST_TIMEOUT_SECONDS = 20
 ACTIVE_EXECUTION_STATUSES = {
     "accepted",
@@ -76,6 +80,10 @@ class AlpacaConfig:
     time_stop_half_lives: float
     time_stop_min_days: int
     reentry_cooldown_days: int
+    min_expected_edge: float
+    min_rebalance_shares: int
+    min_rebalance_notional: float
+    fail_on_reconcile_mismatch: bool
 
 
 def load_env_file(path: Path) -> None:
@@ -179,6 +187,10 @@ def load_config() -> AlpacaConfig:
         time_stop_half_lives=max(parse_float_env("ALPACA_TIME_STOP_HALF_LIVES", DEFAULT_TIME_STOP_HALF_LIVES), 0.0),
         time_stop_min_days=max(parse_int_env("ALPACA_TIME_STOP_MIN_DAYS", DEFAULT_TIME_STOP_MIN_DAYS), 0),
         reentry_cooldown_days=max(parse_int_env("ALPACA_REENTRY_COOLDOWN_DAYS", DEFAULT_REENTRY_COOLDOWN_DAYS), 0),
+        min_expected_edge=max(parse_float_env("ALPACA_MIN_EXPECTED_EDGE", DEFAULT_MIN_EXPECTED_EDGE), 0.0),
+        min_rebalance_shares=max(parse_int_env("ALPACA_MIN_REBALANCE_SHARES", DEFAULT_MIN_REBALANCE_SHARES), 0),
+        min_rebalance_notional=max(parse_float_env("ALPACA_MIN_REBALANCE_NOTIONAL", DEFAULT_MIN_REBALANCE_NOTIONAL), 0.0),
+        fail_on_reconcile_mismatch=parse_bool_env("ALPACA_FAIL_ON_RECONCILE_MISMATCH", DEFAULT_FAIL_ON_RECONCILE_MISMATCH),
     )
 
 
@@ -391,6 +403,27 @@ def has_event_window(row: pd.Series) -> bool:
     return str(raw_value).strip().lower() in {"1", "true", "yes", "y"}
 
 
+def effective_expected_edge(row: pd.Series) -> float:
+    """Estimate the usable per-trade edge after live sizing penalties."""
+    net_current_edge = safe_float(row.get("current_net_expected_edge"))
+    if np.isfinite(net_current_edge):
+        return net_current_edge
+
+    current_edge = safe_float(row.get("current_expected_edge"))
+    if np.isfinite(current_edge):
+        return max(current_edge, 0.0)
+
+    base_edge = safe_float(row.get("oos_return_per_trade"))
+    if not np.isfinite(base_edge):
+        return float("nan")
+
+    size_multiplier = safe_float(row.get("live_size_multiplier", 1.0))
+    if not np.isfinite(size_multiplier):
+        size_multiplier = 1.0
+    size_multiplier = max(size_multiplier, 0.0)
+    return base_edge * size_multiplier
+
+
 def calculate_pair_sizing(row: pd.Series, deployable_capital: float, config: AlpacaConfig) -> Optional[Dict[str, object]]:
     """Convert one pair row into whole-share targets and reject poor hedge geometry."""
     action = str(row.get("current_action", "")).strip()
@@ -463,7 +496,18 @@ def build_executable_ready_universe(
         return pd.DataFrame()
 
     candidates = ready_universe.copy().reset_index(drop=True)
+    candidates["_effective_expected_edge"] = candidates.apply(effective_expected_edge, axis=1)
     candidates["portfolio_weight"] = pd.to_numeric(candidates.get("portfolio_weight"), errors="coerce").fillna(0.0)
+    edge_columns = {"current_net_expected_edge", "current_expected_edge", "oos_return_per_trade"}
+    if edge_columns & set(candidates.columns):
+        candidates = candidates[
+            pd.to_numeric(candidates["_effective_expected_edge"], errors="coerce").fillna(float("-inf")) > 0.0
+        ].reset_index(drop=True)
+    if config.min_expected_edge > 0:
+        candidates = candidates[
+            pd.to_numeric(candidates["_effective_expected_edge"], errors="coerce").fillna(float("-inf"))
+            >= config.min_expected_edge
+        ].reset_index(drop=True)
     candidates = candidates[candidates["portfolio_weight"] > 0].reset_index(drop=True)
     if candidates.empty:
         return pd.DataFrame(columns=ready_universe.columns)
@@ -528,7 +572,10 @@ def build_executable_ready_universe(
     if best_subset is None:
         return pd.DataFrame(columns=ready_universe.columns)
 
-    return best_subset.drop(columns=["_actual_gross_notional", "_base_portfolio_weight"], errors="ignore").reset_index(drop=True)
+    return best_subset.drop(
+        columns=["_actual_gross_notional", "_base_portfolio_weight"],
+        errors="ignore",
+    ).reset_index(drop=True)
 
 
 def build_leg_targets(ready_universe: pd.DataFrame, deployable_capital: float, config: AlpacaConfig) -> pd.DataFrame:
@@ -679,6 +726,7 @@ def build_order_preview(
     current_positions: Dict[str, int],
     managed_symbols: List[str],
     flatten_symbols: Optional[Set[str]] = None,
+    config: Optional[AlpacaConfig] = None,
 ) -> pd.DataFrame:
     """Build rebalance orders from desired and current shares."""
     flatten_symbols = set(flatten_symbols or set())
@@ -711,6 +759,16 @@ def build_order_preview(
             continue
         if target_map.get(symbol, {}).get("event_no_add", False) and abs(target_qty) > abs(current_qty):
             continue
+        if (
+            config is not None
+            and should_skip_small_rebalance(
+                current_qty=current_qty,
+                target_qty=target_qty,
+                reference_price=safe_float(target_map.get(symbol, {}).get("reference_price")),
+                config=config,
+            )
+        ):
+            continue
 
         side = "buy" if delta_qty > 0 else "sell"
         preview_rows.append(
@@ -732,6 +790,32 @@ def build_order_preview(
         )
 
     return pd.DataFrame(preview_rows)
+
+
+def should_skip_small_rebalance(
+    *,
+    current_qty: int,
+    target_qty: int,
+    reference_price: float,
+    config: AlpacaConfig,
+) -> bool:
+    """Skip tiny same-direction top-ups that are likely to cost more than they add."""
+    if config.min_rebalance_shares <= 0 and config.min_rebalance_notional <= 0:
+        return False
+    if current_qty == 0 or target_qty == 0:
+        return False
+    if (current_qty > 0 > target_qty) or (current_qty < 0 < target_qty):
+        return False
+
+    delta_qty = abs(target_qty - current_qty)
+    delta_notional = delta_qty * reference_price if np.isfinite(reference_price) and reference_price > 0 else float("nan")
+    below_share_floor = config.min_rebalance_shares > 0 and delta_qty < config.min_rebalance_shares
+    below_notional_floor = (
+        config.min_rebalance_notional > 0
+        and np.isfinite(delta_notional)
+        and delta_notional < config.min_rebalance_notional
+    )
+    return below_share_floor or below_notional_floor
 
 
 def print_order_preview(preview_df: pd.DataFrame) -> None:
@@ -907,6 +991,56 @@ def build_position_details_map(positions: List[Dict[str, object]]) -> Dict[str, 
             "current_price": safe_float(position.get("current_price")),
         }
     return position_details
+
+
+def build_latest_snapshot_position_map(snapshot_df: pd.DataFrame) -> Dict[str, int]:
+    """Collapse the most recent local position snapshot into a signed quantity map."""
+    if snapshot_df.empty or "captured_at" not in snapshot_df.columns or "symbol" not in snapshot_df.columns:
+        return {}
+
+    normalized = snapshot_df.copy()
+    normalized["captured_at"] = pd.to_datetime(normalized["captured_at"], errors="coerce")
+    normalized = normalized.dropna(subset=["captured_at"])
+    if normalized.empty:
+        return {}
+
+    latest_capture = normalized["captured_at"].max()
+    latest_rows = normalized[normalized["captured_at"] == latest_capture]
+    snapshot_positions: Dict[str, int] = {}
+    for _, row in latest_rows.iterrows():
+        symbol = str(row.get("symbol", "")).upper()
+        qty = int(round(safe_float(row.get("qty", 0.0))))
+        side = str(row.get("side", "")).lower()
+        if side == "short":
+            qty = -abs(qty)
+        elif side == "long":
+            qty = abs(qty)
+        if symbol:
+            snapshot_positions[symbol] = qty
+    return snapshot_positions
+
+
+def find_position_reconciliation_mismatches(
+    current_positions: Dict[str, int],
+    latest_snapshot_positions: Dict[str, int],
+) -> List[str]:
+    """Report symbols whose live quantities differ from the most recent local snapshot."""
+    mismatches: List[str] = []
+    for symbol in sorted(set(current_positions) | set(latest_snapshot_positions)):
+        live_qty = int(current_positions.get(symbol, 0))
+        local_qty = int(latest_snapshot_positions.get(symbol, 0))
+        if live_qty != local_qty:
+            mismatches.append(f"{symbol}: live={live_qty}, local={local_qty}")
+    return mismatches
+
+
+def get_orphan_position_symbols(current_positions: Dict[str, int], managed_symbols: Set[str]) -> Set[str]:
+    """Return live positions that no longer belong to the current signal universe."""
+    return {
+        symbol
+        for symbol, qty in current_positions.items()
+        if int(qty) != 0 and symbol not in managed_symbols
+    }
 
 
 def estimate_pair_unrealized_pnl(pair_row: pd.Series, position_details: Dict[str, Dict[str, float]]) -> float:
@@ -1278,33 +1412,45 @@ def get_flatten_symbols_from_live_universe(live_universe: pd.DataFrame, blocked_
     if live_universe.empty:
         return set()
 
-    flatten_rows = pd.DataFrame()
+    current_position = pd.Series(dtype=float)
     if "current_position" in live_universe.columns:
         current_position = pd.to_numeric(live_universe["current_position"], errors="coerce").fillna(0)
-        flatten_rows = pd.concat([flatten_rows, live_universe[current_position == 0]], ignore_index=True)
+
+    flatten_row_indexes: Set[int] = set()
+    if "current_position" in live_universe.columns:
+        flatten_row_indexes.update(live_universe.index[current_position == 0].tolist())
 
     if blocked_pairs:
-        flatten_rows = pd.concat(
-            [
-                flatten_rows,
-                live_universe[live_universe["pair"].astype(str).isin(blocked_pairs)],
-            ],
-            ignore_index=True,
+        flatten_row_indexes.update(
+            live_universe.index[live_universe["pair"].astype(str).isin(blocked_pairs)].tolist()
         )
 
     if "live_recommendation" in live_universe.columns:
-        flatten_rows = pd.concat(
-            [
-                flatten_rows,
-                live_universe[live_universe["live_recommendation"].astype(str) == "QUALIFIED_BUT_BLOCKED"],
-            ],
-            ignore_index=True,
+        flatten_row_indexes.update(
+            live_universe.index[
+                live_universe["live_recommendation"].astype(str) == "QUALIFIED_BUT_BLOCKED"
+            ].tolist()
         )
 
-    if flatten_rows.empty:
+    if not flatten_row_indexes:
         return set()
 
-    return extract_pair_symbols(flatten_rows.drop_duplicates(subset=["sector", "pair"], keep="last"))
+    flatten_rows = live_universe.loc[sorted(flatten_row_indexes)].drop_duplicates(subset=["sector", "pair"], keep="last")
+    flatten_symbols = extract_pair_symbols(flatten_rows)
+
+    active_protected_symbols = set()
+    if "current_position" in live_universe.columns:
+        active_mask = current_position != 0
+        if "current_action" in live_universe.columns:
+            active_mask = active_mask & live_universe["current_action"].astype(str).isin({"LONG_SPREAD", "SHORT_SPREAD"})
+        active_rows = live_universe.loc[active_mask].drop_duplicates(subset=["sector", "pair"], keep="last")
+        if not active_rows.empty:
+            active_pairs = set(active_rows["pair"].astype(str))
+            flatten_pairs = set(flatten_rows["pair"].astype(str))
+            protected_rows = active_rows[~active_rows["pair"].astype(str).isin(flatten_pairs)]
+            active_protected_symbols = extract_pair_symbols(protected_rows)
+
+    return flatten_symbols - active_protected_symbols
 
 
 def build_pair_lifecycle_rows(pair_universe: pd.DataFrame, pair_trade_plan: pd.DataFrame) -> pd.DataFrame:
@@ -1765,6 +1911,10 @@ def main() -> None:
     account_snapshot_df = build_account_snapshot_rows(account, deployable_capital)
     positions_snapshot_df = build_positions_snapshot_rows(positions)
 
+    current_positions = build_current_position_map(positions)
+    latest_snapshot_positions = build_latest_snapshot_position_map(load_csv(POSITIONS_SNAPSHOT_LOG_OUTPUT))
+    reconciliation_mismatches = find_position_reconciliation_mismatches(current_positions, latest_snapshot_positions)
+
     append_csv_rows(ACCOUNT_SNAPSHOT_LOG_OUTPUT, account_snapshot_df)
     append_csv_rows(POSITIONS_SNAPSHOT_LOG_OUTPUT, positions_snapshot_df)
     append_csv_rows(PAIR_LIFECYCLE_LOG_OUTPUT, pair_lifecycle_df)
@@ -1780,15 +1930,17 @@ def main() -> None:
 
     all_managed_symbols = sorted(extract_pair_symbols(live_universe))
     flatten_symbols = get_flatten_symbols_from_live_universe(live_universe, blocked_pairs)
+    orphan_symbols = get_orphan_position_symbols(current_positions, set(all_managed_symbols))
+    flatten_symbols.update(orphan_symbols)
     if config.flatten_on_no_targets and leg_targets.empty:
         flatten_symbols.update(all_managed_symbols)
 
-    current_positions = build_current_position_map(positions)
     preview_df = build_order_preview(
         leg_targets,
         current_positions,
         all_managed_symbols,
         flatten_symbols=flatten_symbols,
+        config=config,
     )
     preview_df.to_csv(ORDER_PREVIEW_OUTPUT, index=False)
 
@@ -1802,10 +1954,17 @@ def main() -> None:
         print(f"Pair round-trip log updated: {PAIR_ROUNDTRIP_LOG_OUTPUT.resolve()}")
     if flatten_symbols:
         print(f"Symbols marked for flatten-if-held: {', '.join(sorted(flatten_symbols))}")
+    if orphan_symbols:
+        print(f"Orphan symbols marked for flatten: {', '.join(sorted(orphan_symbols))}")
     if blocked_pairs:
         print(f"Blocked pairs this cycle: {', '.join(sorted(blocked_pairs))}")
     if already_submitted_pairs:
         print(f"Already submitted this signal cycle: {', '.join(sorted(already_submitted_pairs))}")
+    if config.min_expected_edge > 0:
+        print(f"Minimum expected edge per trade: {config.min_expected_edge:.4f}")
+    if reconciliation_mismatches:
+        mismatch_summary = "; ".join(reconciliation_mismatches)
+        print(f"Position reconciliation mismatch detected: {mismatch_summary}")
     if leg_targets.empty or pair_trade_plan.empty:
         if config.flatten_on_no_targets:
             print("No executable target legs were produced from the ready pairs. Managed symbols will be flattened.")
@@ -1828,6 +1987,12 @@ def main() -> None:
             "\nDry run only. Set ALPACA_DRY_RUN=false in .env and run with --execute when you are ready to submit paper orders."
         )
         return
+
+    if config.fail_on_reconcile_mismatch and reconciliation_mismatches:
+        raise ValueError(
+            "Live Alpaca positions do not match the most recent local snapshot. "
+            f"Resolve or reconcile before trading: {'; '.join(reconciliation_mismatches)}"
+        )
 
     if staleness_days > config.max_signal_staleness_days and not args.allow_stale:
         raise ValueError(

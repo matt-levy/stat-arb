@@ -8,6 +8,7 @@ from alpaca_paper_trading import (
     AlpacaClient,
     AlpacaConfig,
     build_live_pair_risk_rows,
+    build_latest_snapshot_position_map,
     build_client_order_id,
     build_executable_ready_universe,
     build_leg_targets,
@@ -20,10 +21,13 @@ from alpaca_paper_trading import (
     execute_orders,
     cancel_conflicting_open_orders,
     extract_pair_symbols,
+    find_position_reconciliation_mismatches,
     filter_blocked_pairs,
+    get_orphan_position_symbols,
     get_flatten_symbols_from_live_universe,
     get_pairs_already_submitted_this_cycle,
     get_pairs_in_cooldown,
+    should_skip_small_rebalance,
 )
 
 
@@ -45,6 +49,10 @@ def make_config() -> AlpacaConfig:
         time_stop_half_lives=3.0,
         time_stop_min_days=5,
         reentry_cooldown_days=3,
+        min_expected_edge=0.0,
+        min_rebalance_shares=0,
+        min_rebalance_notional=0.0,
+        fail_on_reconcile_mismatch=True,
     )
 
 
@@ -73,6 +81,58 @@ class AlpacaPaperTradingTests(unittest.TestCase):
 
         self.assertEqual(extract_pair_symbols(live_universe), {"MU", "LRCX", "BAC", "MS"})
         self.assertEqual(get_flatten_symbols_from_live_universe(live_universe, set()), {"MU", "LRCX", "BAC", "MS"})
+
+    def test_live_universe_does_not_flatten_symbol_used_by_separate_active_pair(self):
+        live_universe = pd.DataFrame(
+            [
+                {
+                    "sector": "banks",
+                    "pair": "C vs GS",
+                    "stock_x": "C",
+                    "stock_y": "GS",
+                    "current_position": 1,
+                    "current_action": "LONG_SPREAD",
+                    "live_recommendation": "ELIGIBLE",
+                },
+                {
+                    "sector": "banks",
+                    "pair": "JPM vs GS",
+                    "stock_x": "JPM",
+                    "stock_y": "GS",
+                    "current_position": 0,
+                    "current_action": "FLAT",
+                    "live_recommendation": "MONITOR",
+                },
+            ]
+        )
+
+        self.assertEqual(get_flatten_symbols_from_live_universe(live_universe, set()), {"JPM"})
+
+    def test_live_universe_keeps_blocked_active_pair_symbols_marked_for_flatten(self):
+        live_universe = pd.DataFrame(
+            [
+                {
+                    "sector": "banks",
+                    "pair": "C vs GS",
+                    "stock_x": "C",
+                    "stock_y": "GS",
+                    "current_position": 1,
+                    "current_action": "LONG_SPREAD",
+                    "live_recommendation": "QUALIFIED_BUT_BLOCKED",
+                },
+                {
+                    "sector": "banks",
+                    "pair": "JPM vs GS",
+                    "stock_x": "JPM",
+                    "stock_y": "GS",
+                    "current_position": 0,
+                    "current_action": "FLAT",
+                    "live_recommendation": "MONITOR",
+                },
+            ]
+        )
+
+        self.assertEqual(get_flatten_symbols_from_live_universe(live_universe, set()), {"C", "GS", "JPM"})
 
     def test_pair_lifecycle_distinguishes_executable_blocked_and_flatten_if_held(self):
         live_universe = pd.DataFrame(
@@ -218,6 +278,69 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         leg_targets = build_leg_targets(ready_universe, deployable_capital=5000.0, config=make_config())
 
         self.assertTrue(leg_targets.empty)
+
+    def test_build_executable_ready_universe_filters_pairs_below_expected_edge_floor(self):
+        config = make_config()
+        config.min_expected_edge = 0.02
+        ready_universe = pd.DataFrame(
+            [
+                {
+                    "pair": "LOW EDGE",
+                    "stock_x": "AAA",
+                    "stock_y": "BBB",
+                    "current_action": "LONG_SPREAD",
+                    "portfolio_weight": 0.5,
+                    "live_beta": 1.0,
+                    "live_zscore": -1.8,
+                    "live_size_multiplier": 1.0,
+                    "oos_return_per_trade": 0.01,
+                    "current_net_expected_edge": 0.01,
+                    "latest_price_x": 100.0,
+                    "latest_price_y": 100.0,
+                },
+                {
+                    "pair": "HIGH EDGE",
+                    "stock_x": "CCC",
+                    "stock_y": "DDD",
+                    "current_action": "SHORT_SPREAD",
+                    "portfolio_weight": 0.5,
+                    "live_beta": 1.0,
+                    "live_zscore": 1.9,
+                    "live_size_multiplier": 1.0,
+                    "oos_return_per_trade": 0.03,
+                    "current_net_expected_edge": 0.03,
+                    "latest_price_x": 100.0,
+                    "latest_price_y": 100.0,
+                },
+            ]
+        )
+
+        executable = build_executable_ready_universe(ready_universe, deployable_capital=1000.0, config=config)
+
+        self.assertEqual(list(executable["pair"]), ["HIGH EDGE"])
+
+    def test_build_executable_ready_universe_rejects_negative_net_edge_after_cost_hurdle(self):
+        ready_universe = pd.DataFrame(
+            [
+                {
+                    "pair": "NEG EDGE",
+                    "stock_x": "AAA",
+                    "stock_y": "BBB",
+                    "current_action": "LONG_SPREAD",
+                    "portfolio_weight": 1.0,
+                    "live_beta": 1.0,
+                    "live_zscore": -1.8,
+                    "live_size_multiplier": 1.0,
+                    "current_net_expected_edge": -0.001,
+                    "latest_price_x": 100.0,
+                    "latest_price_y": 100.0,
+                }
+            ]
+        )
+
+        executable = build_executable_ready_universe(ready_universe, deployable_capital=1000.0, config=make_config())
+
+        self.assertTrue(executable.empty)
 
     def test_build_executable_ready_universe_redistributes_failed_pair_weight(self):
         ready_universe = pd.DataFrame(
@@ -392,6 +515,49 @@ class AlpacaPaperTradingTests(unittest.TestCase):
         self.assertEqual(list(preview_df["symbol"]), ["C"])
         self.assertEqual(list(preview_df["side"]), ["buy"])
         self.assertEqual(list(preview_df["order_qty"]), [1])
+
+    def test_build_order_preview_skips_small_same_direction_rebalance(self):
+        config = make_config()
+        config.min_rebalance_shares = 2
+        config.min_rebalance_notional = 200.0
+        leg_targets = pd.DataFrame(
+            [
+                {
+                    "symbol": "C",
+                    "target_qty": 11,
+                    "reference_price": 100.0,
+                    "target_notional": 1100.0,
+                    "source_pairs": "C vs GS",
+                    "notional_imbalance_pct": 0.02,
+                    "near_exit_no_add": False,
+                    "event_no_add": False,
+                    "event_reason": "",
+                }
+            ]
+        )
+
+        preview_df = build_order_preview(
+            leg_targets=leg_targets,
+            current_positions={"C": 10},
+            managed_symbols=["C"],
+            config=config,
+        )
+
+        self.assertTrue(preview_df.empty)
+
+    def test_should_skip_small_rebalance_does_not_block_full_exit(self):
+        config = make_config()
+        config.min_rebalance_shares = 2
+        config.min_rebalance_notional = 200.0
+
+        self.assertFalse(
+            should_skip_small_rebalance(
+                current_qty=1,
+                target_qty=0,
+                reference_price=100.0,
+                config=config,
+            )
+        )
 
     def test_build_live_pair_attribution_rows_reports_leg_pnl_and_imbalance(self):
         live_universe = pd.DataFrame(
@@ -723,6 +889,35 @@ class AlpacaPaperTradingTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertNotEqual(first, changed)
+
+    def test_build_latest_snapshot_position_map_uses_most_recent_capture(self):
+        snapshot_df = pd.DataFrame(
+            [
+                {"captured_at": "2026-05-01T16:00:00", "symbol": "C", "side": "long", "qty": 5},
+                {"captured_at": "2026-05-02T16:00:00", "symbol": "C", "side": "long", "qty": 7},
+                {"captured_at": "2026-05-02T16:00:00", "symbol": "GS", "side": "short", "qty": -1},
+            ]
+        )
+
+        position_map = build_latest_snapshot_position_map(snapshot_df)
+
+        self.assertEqual(position_map, {"C": 7, "GS": -1})
+
+    def test_find_position_reconciliation_mismatches_reports_differences(self):
+        mismatches = find_position_reconciliation_mismatches(
+            current_positions={"C": 10, "GS": -1},
+            latest_snapshot_positions={"C": 11, "GS": -1},
+        )
+
+        self.assertEqual(mismatches, ["C: live=10, local=11"])
+
+    def test_get_orphan_position_symbols_finds_live_symbols_outside_current_universe(self):
+        orphan_symbols = get_orphan_position_symbols(
+            current_positions={"C": 10, "GS": -1, "CP": 23},
+            managed_symbols={"C", "GS"},
+        )
+
+        self.assertEqual(orphan_symbols, {"CP"})
 
 
 if __name__ == "__main__":

@@ -32,6 +32,10 @@ READY_OUTPUT_COLUMNS = [
     "live_zscore",
     "live_beta",
     "live_half_life",
+    "current_edge_to_exit_ratio",
+    "current_expected_edge",
+    "estimated_round_trip_cost",
+    "current_net_expected_edge",
     "passes_live_stability",
     "live_stability_reason",
     "live_degradation_score",
@@ -55,6 +59,7 @@ READY_OUTPUT_COLUMNS = [
     "robustness_pass_rate",
     "oos_sharpe",
     "oos_return",
+    "oos_return_per_trade",
     "oos_annualized_return",
     "oos_max_drawdown",
     "oos_trades",
@@ -203,28 +208,28 @@ def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) ->
     if ready_live.empty:
         return pd.DataFrame(columns=READY_OUTPUT_COLUMNS)
 
-    ranked_subset = ranked_pairs[
-        [
-            "sector",
-            "pair",
-            "research_verdict",
-            "research_recommendation",
-            "score",
-            "confidence_score",
-            "confidence_rank",
-            "robustness_score",
-            "robustness_pass_rate",
-            "oos_sharpe",
-            "oos_return",
-            "oos_annualized_return",
-            "oos_max_drawdown",
-            "oos_trades",
-            "oos_unique_test_days",
-            "avg_coint_pvalue_passed",
-            "avg_adf_pvalue_passed",
-            "avg_half_life_passed",
-        ]
-    ].copy()
+    ranked_columns = [
+        "sector",
+        "pair",
+        "research_verdict",
+        "research_recommendation",
+        "score",
+        "confidence_score",
+        "confidence_rank",
+        "robustness_score",
+        "robustness_pass_rate",
+        "oos_sharpe",
+        "oos_return",
+        "oos_return_per_trade",
+        "oos_annualized_return",
+        "oos_max_drawdown",
+        "oos_trades",
+        "oos_unique_test_days",
+        "avg_coint_pvalue_passed",
+        "avg_adf_pvalue_passed",
+        "avg_half_life_passed",
+    ]
+    ranked_subset = ranked_pairs.reindex(columns=ranked_columns).copy()
 
     merged = ready_live.merge(ranked_subset, on=["sector", "pair"], how="left")
     if merged.empty:
@@ -234,6 +239,10 @@ def build_ready_pairs(live_signals: pd.DataFrame, ranked_pairs: pd.DataFrame) ->
         "live_degradation_score": np.nan,
         "live_stability_tier": "",
         "live_size_multiplier": 1.0,
+        "current_edge_to_exit_ratio": 0.0,
+        "current_expected_edge": 0.0,
+        "estimated_round_trip_cost": 0.0,
+        "current_net_expected_edge": 0.0,
         "passes_leg_contribution": True,
         "leg_contribution_reason": "",
         "recent_x_contribution": np.nan,
